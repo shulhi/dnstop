@@ -1630,9 +1630,13 @@ AgentAddr_report_printable(hashtbl * tbl, const char *what)
 }
 
 void
-printable_report(void)
+*printable_report(void *args)
 {
         // Call to AgentAddr_report version printable
+        printf("%s\n", "Calling from printable report...");
+        sleep(1);
+
+        return NULL;
 }
 
 /*
@@ -2074,6 +2078,10 @@ main(int argc, char *argv[])
         init_curses();
         redraw();
 
+        // Spawn new thread for printing report to file
+        pthread_t pth_id;
+        pthread_create(&pth_id, NULL, printable_report, NULL);
+
         if (redraw_interval) {
             signal(SIGALRM, gotsigalrm);
             redraw_itv.it_interval.tv_sec = redraw_interval;
@@ -2104,6 +2112,8 @@ main(int argc, char *argv[])
                 redraw();
             keyboard();
         }
+
+        pthread_join(pth_id, NULL);
         endwin();               /* klin, Thu Nov 28 08:56:51 2002 */
     } else {
         while (pcap_dispatch(pcap, 1, handle_pcap, NULL)) {
