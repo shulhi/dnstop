@@ -1566,6 +1566,9 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
     if (W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
         W1 = ncols - 1 - WC - 1 - WP - 1 - WP - 1;
 
+    // Create file for writing
+    FILE *f = fopen("/tmp/dnstop.txt", "a");
+
     if (NULL == col2 || NULL == F2) {
         snprintf(fmt1, 64, "%%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, WC, WP, WP);
         snprintf(fmt2, 64, "%%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, WC, WP, WP);
@@ -1579,6 +1582,10 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
                 (sorted + i)->cnt,
                 100.0 * (sorted + i)->cnt / base,
                 100.0 * sum / base);
+
+            if(f != NULL) {
+                fprintf(f, "%s\n", t);
+            }
         }
     } else {
         for (i = 0; i < nlines; i++) {
@@ -1602,8 +1609,14 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
                 (sorted + i)->cnt,
                 100.0 * (sorted + i)->cnt / base,
                 100.0 * sum / base);
+
+            if(f != NULL) {
+                fprintf(f, "%s\n", t);
+            }
         }
     }
+
+    fclose(f);
 }
 
 void
@@ -1633,8 +1646,8 @@ void
 *printable_report(void *args)
 {
         // Call to AgentAddr_report version printable
-        printf("%s\n", "Calling from printable report...");
-        sleep(1);
+        AgentAddr_report_printable(Sources, "Sources");
+        sleep(5);
 
         return NULL;
 }
