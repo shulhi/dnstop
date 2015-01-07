@@ -1,8 +1,8 @@
 /*
  * $Id: dnstop.c,v 1.112 2012/06/11 20:09:22 wessels Exp $
- * 
+ *
  * http://dnstop.measurement-factory.com/
- * 
+ *
  * Copyright (c) 2002, The Measurement Factory, Inc.  All rights reserved.  See
  * the LICENSE file for details.
  */
@@ -17,6 +17,9 @@ static const char *Version = "20120611";
 #include <fcntl.h>
 
 #include <netinet/in.h>
+
+#include <pthread.h>
+#include <limits.h>
 
 #include <pcap.h>
 #include <signal.h>
@@ -47,8 +50,8 @@ static const char *Version = "20120611";
 
 #ifdef HAVE_NET_IF_PPP_H
 #include <net/if_ppp.h>
-#define PPP_ADDRESS_VAL       0xff	/* The address byte value */
-#define PPP_CONTROL_VAL       0x03	/* The control byte value */
+#define PPP_ADDRESS_VAL       0xff      /* The address byte value */
+#define PPP_CONTROL_VAL       0x03      /* The control byte value */
 #endif
 
 #include "hashtbl.h"
@@ -73,6 +76,8 @@ static const char *Version = "20120611";
 #define uh_dport dest
 #define uh_sport source
 #endif
+
+#define ENOUGH (CHAR_BIT * sizeof(int) - 1) / 3 + 2
 
 typedef struct {
     inX_addr src;
@@ -127,9 +132,9 @@ char *device = NULL;
 pcap_t *pcap = NULL;
 /*
  * bpf_program_str used to default to:
- * 
+ *
  * udp dst port 53 and udp[10:2] & 0x8000 = 0
- * 
+ *
  * but that didn't work so well with IPv6.  Now we have the command line options
  * -Q and -R to choose counting queries, responses, or both.
  */
@@ -155,6 +160,14 @@ int opt_count_ipv4 = 0;
 int opt_count_ipv6 = 0;
 int opt_count_domsrc = 1;
 const char *opt_filter_by_name = 0;
+
+/*
+ * Custom flags
+ */
+// if set to true, will print report to local disk after set interval
+int printable = 0;
+int opt_printable_interval = 30;
+char *file_path = "/tmp";
 
 /*
  * flags/features for non-interactive mode
@@ -270,8 +283,8 @@ ignore_list_match(const inX_addr * addr)
     ip_list_t *ptr;
 
     for (ptr = IgnoreList; ptr != NULL; ptr = ptr->next)
-	if (0 == inXaddr_cmp(addr, &ptr->addr))
-	    return (1);
+        if (0 == inXaddr_cmp(addr, &ptr->addr))
+            return (1);
     return (0);
 }
 
@@ -280,11 +293,11 @@ ignore_list_add(const inX_addr * addr)
 {
     ip_list_t *new;
     if (ignore_list_match(addr) != 0)
-	return;
+        return;
     new = malloc(sizeof(ip_list_t));
     if (new == NULL) {
-	perror("malloc");
-	return;
+        perror("malloc");
+        return;
     }
     new->addr = *addr;
     new->next = IgnoreList;
@@ -300,18 +313,18 @@ ignore_list_add_name(const char *name)
     int status;
     status = getaddrinfo(name, NULL, NULL, &ai_list);
     if (status != 0)
-	return;
+        return;
     for (ai_ptr = ai_list; ai_ptr != NULL; ai_ptr = ai_ptr->ai_next) {
-	if (ai_ptr->ai_family == AF_INET) {
-	    inXaddr_assign_v4(&addr, &((struct sockaddr_in *)ai_ptr->ai_addr)->
-		sin_addr);
-	    ignore_list_add(&addr);
-	}
+        if (ai_ptr->ai_family == AF_INET) {
+            inXaddr_assign_v4(&addr, &((struct sockaddr_in *)ai_ptr->ai_addr)->
+                sin_addr);
+            ignore_list_add(&addr);
+        }
 #if USE_IPV6
-	else if (ai_ptr->ai_family == AF_INET6) {
-	    inXaddr_assign_v6(&addr, &((struct sockaddr_in6 *)ai_ptr->ai_addr)->sin6_addr);
-	    ignore_list_add(&addr);
-	}
+        else if (ai_ptr->ai_family == AF_INET6) {
+            inXaddr_assign_v6(&addr, &((struct sockaddr_in6 *)ai_ptr->ai_addr)->sin6_addr);
+            ignore_list_add(&addr);
+        }
 #endif
     }
     freeaddrinfo(ai_list);
@@ -325,39 +338,39 @@ allocate_anonymous_address(inX_addr * anon_addr, const inX_addr * orig_addr)
     ip_list_t *ptr;
 
     for (ptr = list; ptr != NULL; ptr = ptr->next) {
-	if (0 == inXaddr_cmp(orig_addr, &ptr->addr))
-	    break;
+        if (0 == inXaddr_cmp(orig_addr, &ptr->addr))
+            break;
     }
 
     if (-1 == entropy_fd) {
-	entropy_fd = open("/dev/urandom", 0);
-	if (-1 == entropy_fd) {
-	    entropy_fd = open("/dev/random", 0);
-	    if (-1 == entropy_fd) {
-		fprintf(stderr, "failed to open /dev/urandom or /dev/random");
-		exit(1);
-	    }
-	}
+        entropy_fd = open("/dev/urandom", 0);
+        if (-1 == entropy_fd) {
+            entropy_fd = open("/dev/random", 0);
+            if (-1 == entropy_fd) {
+                fprintf(stderr, "failed to open /dev/urandom or /dev/random");
+                exit(1);
+            }
+        }
     }
     if (ptr == NULL) {
-	char buf[16];
-	ptr = (ip_list_t *) malloc(sizeof(ip_list_t) + sizeof(inX_addr));
-	if (ptr == NULL)
-	    return;
-	ptr->addr = *orig_addr;
-	ptr->data = (void *)(ptr + 1);
-	if (4 == inXaddr_version(orig_addr)) {
-	    read(entropy_fd, buf, 4);
-	    inXaddr_assign_v4(ptr->data, (struct in_addr *)buf);
-	}
+        char buf[16];
+        ptr = (ip_list_t *) malloc(sizeof(ip_list_t) + sizeof(inX_addr));
+        if (ptr == NULL)
+            return;
+        ptr->addr = *orig_addr;
+        ptr->data = (void *)(ptr + 1);
+        if (4 == inXaddr_version(orig_addr)) {
+            read(entropy_fd, buf, 4);
+            inXaddr_assign_v4(ptr->data, (struct in_addr *)buf);
+        }
 #if USE_IPV6
-	else {
-	    read(entropy_fd, buf, 16);
-	    inXaddr_assign_v6(ptr->data, (struct in6_addr *)buf);
-	}
+        else {
+            read(entropy_fd, buf, 16);
+            inXaddr_assign_v6(ptr->data, (struct in6_addr *)buf);
+        }
 #endif
-	ptr->next = list;
-	list = ptr;
+        ptr->next = list;
+        list = ptr;
     }
     *anon_addr = *(inX_addr *) ptr->data;
 }
@@ -368,8 +381,8 @@ anon_inet_ntoa(const inX_addr * addr)
     static char buffer[INET6_ADDRSTRLEN];
     inX_addr anon_addr;
     if (anon_flag) {
-	allocate_anonymous_address(&anon_addr, addr);
-	addr = &anon_addr;
+        allocate_anonymous_address(&anon_addr, addr);
+        addr = &anon_addr;
     }
     return inXaddr_ntop(addr, buffer, sizeof(buffer));
 }
@@ -379,9 +392,9 @@ AgentAddr_lookup_or_add(hashtbl * tbl, const inX_addr * addr)
 {
     AgentAddr *x = hash_find(addr, tbl);
     if (NULL == x) {
-	x = calloc(1, sizeof(*x));
-	x->src = *addr;
-	hash_add(&x->src, x, tbl);
+        x = calloc(1, sizeof(*x));
+        x->src = *addr;
+        hash_add(&x->src, x, tbl);
     }
     return x;
 }
@@ -404,9 +417,9 @@ StringCounter_lookup_or_add(hashtbl * tbl, const char *s)
 {
     StringCounter *x = hash_find(s, tbl);
     if (NULL == x) {
-	x = calloc(1, sizeof(*x));
-	x->s = strdup(s);
-	hash_add(x->s, x, tbl);
+        x = calloc(1, sizeof(*x));
+        x->s = strdup(s);
+        hash_add(x->s, x, tbl);
     }
     return x;
 }
@@ -427,7 +440,7 @@ stringaddr_cmp(const void *a, const void *b)
     const StringAddr *B = b;
     int x = inXaddr_cmp(&A->addr, &B->addr);
     if (x)
-	return x;
+        return x;
     return strcmp(A->str, B->str);
 }
 
@@ -440,10 +453,10 @@ StringAddrCounter_lookup_or_add(hashtbl * tbl, const inX_addr * addr, const char
     sa.str = (char *)str;
     x = hash_find(&sa, tbl);
     if (NULL == x) {
-	x = calloc(1, sizeof(*x));
-	x->straddr.str = strdup(str);
-	x->straddr.addr = *addr;
-	hash_add(&x->straddr, x, tbl);
+        x = calloc(1, sizeof(*x));
+        x->straddr.str = strdup(str);
+        x->straddr.addr = *addr;
+        hash_add(&x->straddr, x, tbl);
     }
     return x;
 }
@@ -454,13 +467,13 @@ SortItem_cmp(const void *A, const void *B)
     const SortItem *a = A;
     const SortItem *b = B;
     if (a->cnt < b->cnt)
-	return 1;
+        return 1;
     if (a->cnt > b->cnt)
-	return -1;
+        return -1;
     if (a->ptr < b->ptr)
-	return 1;
+        return 1;
     if (a->ptr > b->ptr)
-	return -1;
+        return -1;
     return 0;
 }
 
@@ -474,59 +487,59 @@ rfc1035NameUnpack(const char *buf, size_t sz, off_t * off, char *name, size_t ns
     size_t len;
     static int loop_detect = 0;
     if (loop_detect > 2)
-	return 4;		/* compression loop */
+        return 4;               /* compression loop */
     if (ns <= 0)
-	return 4;		/* probably compression loop */
+        return 4;               /* probably compression loop */
     do {
-	if ((*off) >= sz)
-	    break;
-	c = *(buf + (*off));
-	if (c > 191) {
-	    /* blasted compression */
-	    int rc;
-	    unsigned short s;
-	    off_t ptr;
-	    memcpy(&s, buf + (*off), sizeof(s));
-	    s = ntohs(s);
-	    (*off) += sizeof(s);
-	    /* Sanity check */
-	    if ((*off) >= sz)
-		return 1;	/* message too short */
-	    ptr = s & 0x3FFF;
-	    /* Make sure the pointer is inside this message */
-	    if (ptr >= sz)
-		return 2;	/* bad compression ptr */
-	    if (ptr < DNS_MSG_HDR_SZ)
-		return 2;	/* bad compression ptr */
-	    loop_detect++;
-	    rc = rfc1035NameUnpack(buf, sz, &ptr, name + no, ns - no);
-	    loop_detect--;
-	    return rc;
-	} else if (c > RFC1035_MAXLABELSZ) {
-	    /*
-	     * "(The 10 and 01 combinations are reserved for future use.)"
-	     */
-	    return 3;		/* reserved label/compression flags */
-	    break;
-	} else {
-	    (*off)++;
-	    len = (size_t) c;
-	    if (len == 0)
-		break;
-	    if (len > (ns - 1))
-		len = ns - 1;
-	    if ((*off) + len > sz)
-		return 4;	/* message is too short */
-	    if (no + len + 1 > ns)
-		return 5;	/* qname would overflow name buffer */
-	    memcpy(name + no, buf + (*off), len);
-	    (*off) += len;
-	    no += len;
-	    *(name + (no++)) = '.';
-	}
+        if ((*off) >= sz)
+            break;
+        c = *(buf + (*off));
+        if (c > 191) {
+            /* blasted compression */
+            int rc;
+            unsigned short s;
+            off_t ptr;
+            memcpy(&s, buf + (*off), sizeof(s));
+            s = ntohs(s);
+            (*off) += sizeof(s);
+            /* Sanity check */
+            if ((*off) >= sz)
+                return 1;       /* message too short */
+            ptr = s & 0x3FFF;
+            /* Make sure the pointer is inside this message */
+            if (ptr >= sz)
+                return 2;       /* bad compression ptr */
+            if (ptr < DNS_MSG_HDR_SZ)
+                return 2;       /* bad compression ptr */
+            loop_detect++;
+            rc = rfc1035NameUnpack(buf, sz, &ptr, name + no, ns - no);
+            loop_detect--;
+            return rc;
+        } else if (c > RFC1035_MAXLABELSZ) {
+            /*
+             * "(The 10 and 01 combinations are reserved for future use.)"
+             */
+            return 3;           /* reserved label/compression flags */
+            break;
+        } else {
+            (*off)++;
+            len = (size_t) c;
+            if (len == 0)
+                break;
+            if (len > (ns - 1))
+                len = ns - 1;
+            if ((*off) + len > sz)
+                return 4;       /* message is too short */
+            if (no + len + 1 > ns)
+                return 5;       /* qname would overflow name buffer */
+            memcpy(name + no, buf + (*off), len);
+            (*off) += len;
+            no += len;
+            *(name + (no++)) = '.';
+        }
     } while (c > 0);
     if (no > 0)
-	*(name + no - 1) = '\0';
+        *(name + no - 1) = '\0';
     /* make sure we didn't allow someone to overflow the name buffer */
     assert(no <= ns);
     return 0;
@@ -538,16 +551,16 @@ QnameToNld(const char *qname, int nld)
     const char *t = strrchr(qname, '.');
     int dotcount = 1;
     if (NULL == t)
-	t = qname;
+        t = qname;
     if (0 == strcmp(t, ".arpa"))
-	dotcount--;
+        dotcount--;
     while (t > qname && dotcount < nld) {
-	t--;
-	if ('.' == *t)
-	    dotcount++;
+        t--;
+        if ('.' == *t)
+            dotcount++;
     }
     if (t > qname)
-	t++;
+        t++;
     return t;
 }
 
@@ -570,7 +583,7 @@ handle_dns(const char *buf, int len,
     int lvl;
 
     if (len < sizeof(qh))
-	return 0;
+        return 0;
 
     memcpy(&us, buf + 00, 2);
     qh.id = ntohs(us);
@@ -579,9 +592,9 @@ handle_dns(const char *buf, int len,
     us = ntohs(us);
     qh.qr = (us >> 15) & 0x01;
     if (0 == qh.qr && 0 == opt_count_queries)
-	return 0;
+        return 0;
     if (1 == qh.qr && 0 == opt_count_replies)
-	return 0;
+        return 0;
     qh.opcode = (us >> 11) & 0x0F;
     qh.aa = (us >> 10) & 0x01;
     qh.tc = (us >> 9) & 0x01;
@@ -605,15 +618,15 @@ handle_dns(const char *buf, int len,
     memset(qname, '\0', MAX_QNAME_SZ);
     x = rfc1035NameUnpack(buf, len, &offset, qname, MAX_QNAME_SZ);
     if (0 != x)
-	return 0;
+        return 0;
     if ('\0' == qname[0])
-	strcpy(qname, ".");
+        strcpy(qname, ".");
     while ((t = strchr(qname, '\n')))
-	*t = ' ';
+        *t = ' ';
     while ((t = strchr(qname, '\r')))
-	*t = ' ';
+        *t = ' ';
     for (t = qname; *t; t++)
-	*t = tolower(*t);
+        *t = tolower(*t);
 
     memcpy(&us, buf + offset, 2);
     qtype = ntohs(us);
@@ -621,45 +634,45 @@ handle_dns(const char *buf, int len,
     qclass = ntohs(us);
 
     if (Filter) {
-	FilterData fd;
-	fd.qtype = qtype;
-	fd.qclass = qclass;
-	fd.qname = qname;
-	fd.src_addr = src_addr;
-	fd.dst_addr = dst_addr;
-	fd.rcode = qh.rcode;
-	if (0 == Filter(&fd))
-	    return 0;
+        FilterData fd;
+        fd.qtype = qtype;
+        fd.qclass = qclass;
+        fd.qname = qname;
+        fd.src_addr = src_addr;
+        fd.dst_addr = dst_addr;
+        fd.rcode = qh.rcode;
+        if (0 == Filter(&fd))
+            return 0;
     }
     /* gather stats */
     if (0 == opt_count_replies || 1 == qh.qr) {
-	rcode_counts[qh.rcode]++;
+        rcode_counts[qh.rcode]++;
         if ((agent = AgentAddr_lookup_or_add(Destinations, dst_addr)) != NULL)
-	    agent->count++;
+            agent->count++;
     }
     if (0 == opt_count_queries || 0 == qh.qr) {
-	qtype_counts[qtype]++;
-	qclass_counts[qclass]++;
-	opcode_counts[qh.opcode]++;
+        qtype_counts[qtype]++;
+        qclass_counts[qclass]++;
+        opcode_counts[qh.opcode]++;
         if ((agent = AgentAddr_lookup_or_add(Sources, src_addr)) != NULL)
-	    agent->count++;
-	for (lvl = 1; lvl <= max_level; lvl++) {
-	    s = QnameToNld(qname, lvl);
-	    sc = StringCounter_lookup_or_add(Domains[lvl], s);
-	    sc->count++;
-	    if (opt_count_domsrc) {
-		StringAddrCounter *ssc;
-		ssc = StringAddrCounter_lookup_or_add(DomSrcs[lvl], src_addr, s);
-		ssc->count++;
-	    }
-	}
+            agent->count++;
+        for (lvl = 1; lvl <= max_level; lvl++) {
+            s = QnameToNld(qname, lvl);
+            sc = StringCounter_lookup_or_add(Domains[lvl], s);
+            sc->count++;
+            if (opt_count_domsrc) {
+                StringAddrCounter *ssc;
+                ssc = StringAddrCounter_lookup_or_add(DomSrcs[lvl], src_addr, s);
+                ssc->count++;
+            }
+        }
     }
     if (0 == qh.qr) {
-	query_count_intvl++;
-	query_count_total++;
+        query_count_intvl++;
+        query_count_total++;
     } else {
-	reply_count_intvl++;
-	reply_count_total++;
+        reply_count_intvl++;
+        reply_count_total++;
     }
     return 1;
 }
@@ -670,9 +683,9 @@ handle_udp(const struct udphdr *udp, int len,
     const inX_addr * dst_addr)
 {
     if (check_port && check_port != udp->uh_dport && check_port != udp->uh_sport)
-	return 0;
+        return 0;
     if (0 == handle_dns((char *)(udp + 1), len - sizeof(*udp), src_addr, dst_addr))
-	return 0;
+        return 0;
     return 1;
 }
 
@@ -689,7 +702,7 @@ handle_ipv6(struct ip6_hdr *ipv6, int len)
 
 
     if (0 == opt_count_ipv6)
-	return 0;
+        return 0;
 
     offset = sizeof(struct ip6_hdr);
     nexthdr = ipv6->ip6_nxt;
@@ -698,57 +711,57 @@ handle_ipv6(struct ip6_hdr *ipv6, int len)
     payload_len = ntohs(ipv6->ip6_plen);
 
     if (ignore_list_match(&src_addr))
-	return (0);
+        return (0);
 
     /*
      * Parse extension headers. This only handles the standard headers, as
      * defined in RFC 2460, correctly. Fragments are discarded.
      */
-    while ((IPPROTO_ROUTING == nexthdr)	/* routing header */
-	||(IPPROTO_HOPOPTS == nexthdr)	/* Hop-by-Hop options. */
-	||(IPPROTO_FRAGMENT == nexthdr)	/* fragmentation header. */
-	||(IPPROTO_DSTOPTS == nexthdr)	/* destination options. */
-	||(IPPROTO_DSTOPTS == nexthdr)	/* destination options. */
-	||(IPPROTO_AH == nexthdr)	/* destination options. */
-	||(IPPROTO_ESP == nexthdr)) {	/* encapsulating security payload. */
-	struct {
-	    uint8_t nexthdr;
-	    uint8_t length;
-	}      ext_hdr;
-	uint16_t ext_hdr_len;
+    while ((IPPROTO_ROUTING == nexthdr) /* routing header */
+        ||(IPPROTO_HOPOPTS == nexthdr)  /* Hop-by-Hop options. */
+        ||(IPPROTO_FRAGMENT == nexthdr) /* fragmentation header. */
+        ||(IPPROTO_DSTOPTS == nexthdr)  /* destination options. */
+        ||(IPPROTO_DSTOPTS == nexthdr)  /* destination options. */
+        ||(IPPROTO_AH == nexthdr)       /* destination options. */
+        ||(IPPROTO_ESP == nexthdr)) {   /* encapsulating security payload. */
+        struct {
+            uint8_t nexthdr;
+            uint8_t length;
+        }      ext_hdr;
+        uint16_t ext_hdr_len;
 
-	/* Catch broken packets */
-	if ((offset + sizeof(ext_hdr)) > len)
-	    return (0);
+        /* Catch broken packets */
+        if ((offset + sizeof(ext_hdr)) > len)
+            return (0);
 
-	/* Cannot handle fragments. */
-	if (IPPROTO_FRAGMENT == nexthdr)
-	    return (0);
+        /* Cannot handle fragments. */
+        if (IPPROTO_FRAGMENT == nexthdr)
+            return (0);
 
-	memcpy(&ext_hdr, (char *)ipv6 + offset, sizeof(ext_hdr));
-	nexthdr = ext_hdr.nexthdr;
-	ext_hdr_len = (8 * (ntohs(ext_hdr.length) + 1));
+        memcpy(&ext_hdr, (char *)ipv6 + offset, sizeof(ext_hdr));
+        nexthdr = ext_hdr.nexthdr;
+        ext_hdr_len = (8 * (ntohs(ext_hdr.length) + 1));
 
-	/* This header is longer than the packets payload.. WTF? */
-	if (ext_hdr_len > payload_len)
-	    return (0);
+        /* This header is longer than the packets payload.. WTF? */
+        if (ext_hdr_len > payload_len)
+            return (0);
 
-	offset += ext_hdr_len;
-	payload_len -= ext_hdr_len;
-    }				/* while */
+        offset += ext_hdr_len;
+        payload_len -= ext_hdr_len;
+    }                           /* while */
 
     /* Catch broken and empty packets */
     if (((offset + payload_len) > len)
-	|| (payload_len == 0))
-	return (0);
+        || (payload_len == 0))
+        return (0);
 
     if (IPPROTO_UDP != nexthdr)
-	return (0);
+        return (0);
 
     if (handle_udp((struct udphdr *)((char *)ipv6 + offset), payload_len, &src_addr, &dst_addr) == 0)
-	return (0);
+        return (0);
 
-    return (1);			/* Success */
+    return (1);                 /* Success */
 }
 #endif
 
@@ -762,21 +775,21 @@ handle_ipv4(const struct ip *ip, int len)
 
 #if USE_IPV6
     if (ip->ip_v == 6)
-	return (handle_ipv6((struct ip6_hdr *)ip, len));
+        return (handle_ipv6((struct ip6_hdr *)ip, len));
 #endif
 
     if (0 == opt_count_ipv4)
-	return 0;
+        return 0;
 
     inXaddr_assign_v4(&src_addr, &ip->ip_src);
     inXaddr_assign_v4(&dst_addr, &ip->ip_dst);
     if (ignore_list_match(&src_addr))
-	return (0);
+        return (0);
 
     if (IPPROTO_UDP != ip->ip_p)
-	return 0;
+        return 0;
     if (0 == handle_udp((struct udphdr *)((char *)ip + offset), len - offset, &src_addr, &dst_addr))
-	return 0;
+        return 0;
     return 1;
 }
 
@@ -787,25 +800,25 @@ handle_ppp(const u_char * pkt, int len)
     unsigned short us;
     unsigned short proto;
     if (len < 2)
-	return 0;
+        return 0;
     if (*pkt == PPP_ADDRESS_VAL && *(pkt + 1) == PPP_CONTROL_VAL) {
-	pkt += 2;		/* ACFC not used */
-	len -= 2;
+        pkt += 2;               /* ACFC not used */
+        len -= 2;
     }
     if (len < 2)
-	return 0;
+        return 0;
     if (*pkt % 2) {
-	proto = *pkt;		/* PFC is used */
-	pkt++;
-	len--;
+        proto = *pkt;           /* PFC is used */
+        pkt++;
+        len--;
     } else {
-	memcpy(&us, pkt, sizeof(us));
-	proto = ntohs(us);
-	pkt += 2;
-	len -= 2;
+        memcpy(&us, pkt, sizeof(us));
+        proto = ntohs(us);
+        pkt += 2;
+        len -= 2;
     }
     if (ETHERTYPE_IP != proto && PPP_IP != proto)
-	return 0;
+        return 0;
     return handle_ipv4((struct ip *)pkt, len);
 }
 #endif
@@ -816,10 +829,10 @@ handle_null(const u_char * pkt, int len)
     unsigned int family;
     memcpy(&family, pkt, sizeof(family));
     if (AF_INET == family)
-	return handle_ipv4((struct ip *)(pkt + 4), len - 4);
+        return handle_ipv4((struct ip *)(pkt + 4), len - 4);
 #if USE_IPV6
     if (AF_INET6 == family)
-	return handle_ipv6((struct ip6_hdr *)(pkt + 4), len - 4);
+        return handle_ipv6((struct ip6_hdr *)(pkt + 4), len - 4);
 #endif
     return 0;
 }
@@ -831,10 +844,10 @@ handle_loop(const u_char * pkt, int len)
     unsigned int family;
     memcpy(&family, pkt, sizeof(family));
     if (AF_INET == ntohl(family))
-	return handle_ipv4((struct ip *)(pkt + 4), len - 4);
+        return handle_ipv4((struct ip *)(pkt + 4), len - 4);
 #if USE_IPV6
     if (AF_INET6 == ntohl(family))
-	return handle_ipv6((struct ip6_hdr *)(pkt + 4), len - 4);
+        return handle_ipv6((struct ip6_hdr *)(pkt + 4), len - 4);
 #endif
     return 0;
 }
@@ -855,11 +868,11 @@ handle_ip(const u_char * pkt, int len, unsigned short etype)
 {
 #if USE_IPV6
     if (ETHERTYPE_IPV6 == etype) {
-	return (handle_ipv6((struct ip6_hdr *)pkt, len));
+        return (handle_ipv6((struct ip6_hdr *)pkt, len));
     } else
 #endif
     if (ETHERTYPE_IP == etype) {
-	return handle_ipv4((struct ip *)pkt, len);
+        return handle_ipv4((struct ip *)pkt, len);
     }
     return 0;
 }
@@ -870,13 +883,13 @@ handle_ether(const u_char * pkt, int len)
     struct ether_header *e = (void *)pkt;
     unsigned short etype = ntohs(e->ether_type);
     if (len < ETHER_HDR_LEN)
-	return 0;
+        return 0;
     pkt += ETHER_HDR_LEN;
     len -= ETHER_HDR_LEN;
     if (ETHERTYPE_8021Q == etype) {
-	etype = ntohs(*(unsigned short *)(pkt + 2));
-	pkt += 4;
-	len -= 4;
+        etype = ntohs(*(unsigned short *)(pkt + 2));
+        pkt += 4;
+        len -= 4;
     }
     return handle_ip(pkt, len, etype);
 }
@@ -886,16 +899,16 @@ static int
 handle_linux_sll(const u_char * pkt, int len)
 {
     struct sll_header {
-	uint16_t pkt_type;
-	uint16_t dev_type;
-	uint16_t addr_len;
-	uint8_t addr[8];
-	uint16_t proto_type;
+        uint16_t pkt_type;
+        uint16_t dev_type;
+        uint16_t addr_len;
+        uint8_t addr[8];
+        uint16_t proto_type;
     }         *hdr;
     uint16_t etype;
 
     if (len < sizeof(struct sll_header))
-	return (0);
+        return (0);
 
     hdr = (struct sll_header *)pkt;
     pkt = (u_char *) (hdr + 1);
@@ -904,15 +917,15 @@ handle_linux_sll(const u_char * pkt, int len)
     etype = ntohs(hdr->proto_type);
     return handle_ip(pkt, len, etype);
 }
-#endif				/* DLT_LINUX_SLL */
+#endif                          /* DLT_LINUX_SLL */
 
 void
 handle_pcap(u_char * udata, const struct pcap_pkthdr *hdr, const u_char * pkt)
 {
     if (hdr->caplen < ETHER_HDR_LEN)
-	return;
+        return;
     if (0 == handle_datalink(pkt, hdr->caplen))
-	return;
+        return;
     last_ts = hdr->ts;
 }
 
@@ -949,14 +962,14 @@ keyboard(void)
     do_redraw = 1;
     ch = getch() & 0xff;
     if (ch >= 'A' && ch <= 'Z')
-	ch += 'a' - 'A';
+        ch += 'a' - 'A';
     switch (ch) {
     case 's':
-	SubReport = Sources_report;
-	break;
+        SubReport = Sources_report;
+        break;
     case 'd':
-	SubReport = Destinatioreport;
-	break;
+        SubReport = Destinatioreport;
+        break;
     case '1':
     case '2':
     case '3':
@@ -966,70 +979,70 @@ keyboard(void)
     case '7':
     case '8':
     case '9':
-	SubReport = Domain_report;
-	cur_level = ch - '0';
-	break;
+        SubReport = Domain_report;
+        cur_level = ch - '0';
+        break;
     case '!':
-	SubReport = DomSrc_report;
-	cur_level = 1;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 1;
+        break;
     case 'c':
     case '@':
-	SubReport = DomSrc_report;
-	cur_level = 2;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 2;
+        break;
     case '#':
-	SubReport = DomSrc_report;
-	cur_level = 3;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 3;
+        break;
     case '$':
-	SubReport = DomSrc_report;
-	cur_level = 4;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 4;
+        break;
     case '%':
-	SubReport = DomSrc_report;
-	cur_level = 5;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 5;
+        break;
     case '^':
-	SubReport = DomSrc_report;
-	cur_level = 6;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 6;
+        break;
     case '&':
-	SubReport = DomSrc_report;
-	cur_level = 7;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 7;
+        break;
     case '*':
-	SubReport = DomSrc_report;
-	cur_level = 8;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 8;
+        break;
     case '(':
-	SubReport = DomSrc_report;
-	cur_level = 9;
-	break;
+        SubReport = DomSrc_report;
+        cur_level = 9;
+        break;
     case 't':
-	SubReport = Qtypes_report;
-	break;
+        SubReport = Qtypes_report;
+        break;
     case 'o':
-	SubReport = Opcodes_report;
-	break;
+        SubReport = Opcodes_report;
+        break;
     case 'r':
-	SubReport = Rcodes_report;
-	break;
+        SubReport = Rcodes_report;
+        break;
     case 030:
-	Quit = 1;
-	break;
+        Quit = 1;
+        break;
     case 022:
-	ResetCounters();
-	break;
+        ResetCounters();
+        break;
     case '?':
-	SubReport = Help_report;
-	break;
+        SubReport = Help_report;
+        break;
     case ' ':
-	/* noop - just redraw the screen */
-	break;
+        /* noop - just redraw the screen */
+        break;
     default:
-	do_redraw = old_do_redraw;
-	break;
+        do_redraw = old_do_redraw;
+        break;
     }
 }
 
@@ -1049,23 +1062,23 @@ Help_report(void)
     print_func(" o - Opcodes\n");
     print_func(" r - Rcodes\n");
     print_func(" 1 - 1st level Query Names"
-	"\t! - with Sources\n");
+        "\t! - with Sources\n");
     print_func(" 2 - 2nd level Query Names"
-	"\t@ - with Sources\n");
+        "\t@ - with Sources\n");
     print_func(" 3 - 3rd level Query Names"
-	"\t# - with Sources\n");
+        "\t# - with Sources\n");
     print_func(" 4 - 4th level Query Names"
-	"\t$ - with Sources\n");
+        "\t$ - with Sources\n");
     print_func(" 5 - 5th level Query Names"
-	"\t%% - with Sources\n");
+        "\t%% - with Sources\n");
     print_func(" 6 - 6th level Query Names"
-	"\t^ - with Sources\n");
+        "\t^ - with Sources\n");
     print_func(" 7 - 7th level Query Names"
-	"\t& - with Sources\n");
+        "\t& - with Sources\n");
     print_func(" 8 - 8th level Query Names"
-	"\t* - with Sources\n");
+        "\t* - with Sources\n");
     print_func(" 9 - 9th level Query Names"
-	"\t( - with Sources\n");
+        "\t( - with Sources\n");
     print_func("^R - Reset counters\n");
     print_func("^X - Exit\n");
     print_func("\n");
@@ -1078,67 +1091,67 @@ qtype_str(unsigned int t)
     char buf[30];
     switch (t) {
     case T_A:
-	return "A?";
-	break;
+        return "A?";
+        break;
     case T_NS:
-	return "NS?";
-	break;
+        return "NS?";
+        break;
     case T_CNAME:
-	return "CNAME?";
-	break;
+        return "CNAME?";
+        break;
     case T_SOA:
-	return "SOA?";
-	break;
+        return "SOA?";
+        break;
     case T_PTR:
-	return "PTR?";
-	break;
+        return "PTR?";
+        break;
     case T_MX:
-	return "MX?";
-	break;
+        return "MX?";
+        break;
     case T_TXT:
-	return "TXT?";
-	break;
+        return "TXT?";
+        break;
     case T_SIG:
-	return "SIG?";
-	break;
+        return "SIG?";
+        break;
     case T_KEY:
-	return "KEY?";
-	break;
+        return "KEY?";
+        break;
     case T_AAAA:
-	return "AAAA?";
-	break;
+        return "AAAA?";
+        break;
     case T_LOC:
-	return "LOC?";
-	break;
+        return "LOC?";
+        break;
     case T_SRV:
-	return "SRV?";
-	break;
+        return "SRV?";
+        break;
     case T_A6:
-	return "A6?";
-	break;
+        return "A6?";
+        break;
     case T_DS:
-	return "DS?";
-	break;
+        return "DS?";
+        break;
     case T_RRSIG:
-	return "RRSIG?";
-	break;
+        return "RRSIG?";
+        break;
     case T_NSEC:
-	return "NSEC?";
-	break;
+        return "NSEC?";
+        break;
     case T_DNSKEY:
-	return "DNSKEY?";
-	break;
+        return "DNSKEY?";
+        break;
     case T_SPF:
-	return "SPF?";
-	break;
+        return "SPF?";
+        break;
     case T_ANY:
-	return "ANY?";
-	break;
+        return "ANY?";
+        break;
     default:
-	if (qtypes_buf[t])
-	    return qtypes_buf[t];
-	snprintf(buf, sizeof(buf), "#%hu?", t);
-	return qtypes_buf[t] = strdup(buf);
+        if (qtypes_buf[t])
+            return qtypes_buf[t];
+        snprintf(buf, sizeof(buf), "#%hu?", t);
+        return qtypes_buf[t] = strdup(buf);
     }
     /* NOTREACHED */
 }
@@ -1149,25 +1162,25 @@ opcode_str(unsigned int o)
     static char buf[30];
     switch (o) {
     case 0:
-	return "Query";
-	break;
+        return "Query";
+        break;
     case 1:
-	return "Iquery";
-	break;
+        return "Iquery";
+        break;
     case 2:
-	return "Status";
-	break;
+        return "Status";
+        break;
     case 4:
-	return "Notify";
-	break;
+        return "Notify";
+        break;
     case 5:
-	return "Update";
-	break;
+        return "Update";
+        break;
     default:
-	if (opcodes_buf[o])
-	    return opcodes_buf[o];
-	snprintf(buf, 30, "Opcode%d", o);
-	return opcodes_buf[o] = strdup(buf);
+        if (opcodes_buf[o])
+            return opcodes_buf[o];
+        snprintf(buf, 30, "Opcode%d", o);
+        return opcodes_buf[o] = strdup(buf);
     }
     /* NOTREACHED */
 }
@@ -1178,43 +1191,43 @@ rcode_str(unsigned int r)
     static char buf[30];
     switch (r) {
     case 0:
-	return "Noerror";
-	break;
+        return "Noerror";
+        break;
     case 1:
-	return "Formerr";
-	break;
+        return "Formerr";
+        break;
     case 2:
-	return "Servfail";
-	break;
+        return "Servfail";
+        break;
     case 3:
-	return "Nxdomain";
-	break;
+        return "Nxdomain";
+        break;
     case 4:
-	return "Notimpl";
-	break;
+        return "Notimpl";
+        break;
     case 5:
-	return "Refused";
-	break;
+        return "Refused";
+        break;
     case 6:
-	return "Yxdomain";
-	break;
+        return "Yxdomain";
+        break;
     case 7:
-	return "Yxrrset";
-	break;
+        return "Yxrrset";
+        break;
     case 8:
-	return "Nxrrset";
-	break;
+        return "Nxrrset";
+        break;
     case 9:
-	return "Notauth";
-	break;
+        return "Notauth";
+        break;
     case 10:
-	return "Notzone";
-	break;
+        return "Notzone";
+        break;
     default:
-	if (rcodes_buf[r])
-	    return rcodes_buf[r];
-	snprintf(buf, 30, "Rcode%d", r);
-	return rcodes_buf[r] = strdup(buf);
+        if (rcodes_buf[r])
+            return rcodes_buf[r];
+        snprintf(buf, 30, "Rcode%d", r);
+        return rcodes_buf[r] = strdup(buf);
     }
     /* NOTREACHED */
 }
@@ -1223,18 +1236,18 @@ int
 get_nlines(void)
 {
     if (interactive)
-	return getmaxy(w) - 6;
+        return getmaxy(w) - 6;
     else
-	return 50;
+        return 50;
 }
 
 int
 get_ncols(void)
 {
     if (interactive)
-	return getmaxx(w);
+        return getmaxx(w);
     else
-	return 80;
+        return 80;
 }
 
 const char *
@@ -1261,8 +1274,8 @@ Table_report(SortItem * sorted, int rows, const char *col1, const char *col2, co
 {
     int W1 = strlen(col1);
     int W2 = col2 ? strlen(col2) : 0;
-    int WC = 9;			/* width of "Count" column */
-    int WP = 6;			/* width of "Percent" column */
+    int WC = 9;                 /* width of "Count" column */
+    int WP = 6;                 /* width of "Percent" column */
     int i;
     int nlines = get_nlines();
     int ncols = get_ncols();
@@ -1271,53 +1284,53 @@ Table_report(SortItem * sorted, int rows, const char *col1, const char *col2, co
     unsigned int sum = 0;
 
     if (nlines > rows)
-	nlines = rows;
+        nlines = rows;
 
     for (i = 0; i < nlines; i++) {
-	const char *t = F1(sorted + i);
-	if (W1 < strlen(t))
-	    W1 = strlen(t);
+        const char *t = F1(sorted + i);
+        if (W1 < strlen(t))
+            W1 = strlen(t);
     }
     if (W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
-	W1 = ncols - 1 - WC - 1 - WP - 1 - WP - 1;
+        W1 = ncols - 1 - WC - 1 - WP - 1 - WP - 1;
 
     if (NULL == col2 || NULL == F2) {
-	snprintf(fmt1, 64, "%%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, WC, WP, WP);
-	snprintf(fmt2, 64, "%%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, WC, WP, WP);
-	print_func(fmt1, col1, "Count", "%", "cum%");
-	print_func(fmt1, dashes(W1), dashes(WC), dashes(WP), dashes(WP));
-	for (i = 0; i < nlines; i++) {
-	    sum += (sorted + i)->cnt;
-	    const char *t = F1(sorted + i);
-	    print_func(fmt2,
-		t,
-		(sorted + i)->cnt,
-		100.0 * (sorted + i)->cnt / base,
-		100.0 * sum / base);
-	}
+        snprintf(fmt1, 64, "%%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, WC, WP, WP);
+        snprintf(fmt2, 64, "%%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, WC, WP, WP);
+        print_func(fmt1, col1, "Count", "%", "cum%");
+        print_func(fmt1, dashes(W1), dashes(WC), dashes(WP), dashes(WP));
+        for (i = 0; i < nlines; i++) {
+            sum += (sorted + i)->cnt;
+            const char *t = F1(sorted + i);
+            print_func(fmt2,
+                t,
+                (sorted + i)->cnt,
+                100.0 * (sorted + i)->cnt / base,
+                100.0 * sum / base);
+        }
     } else {
-	for (i = 0; i < nlines; i++) {
-	    const char *t = F2(sorted + i);
-	    if (W2 < strlen(t))
-		W2 = strlen(t);
-	}
-	if (W2 + 1 + W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
-	    W2 = ncols - 1 - W1 - 1 - WC - 1 - WP - 1 - WP - 1;
-	snprintf(fmt1, 64, "%%-%d.%ds %%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, W2, W2, WC, WP, WP);
-	snprintf(fmt2, 64, "%%-%d.%ds %%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, W2, W2, WC, WP, WP);
-	print_func(fmt1, col1, col2, "Count", "%", "cum%");
-	print_func(fmt1, dashes(W1), dashes(W2), dashes(WC), dashes(WP), dashes(WP));
-	for (i = 0; i < nlines; i++) {
-	    const char *t = F1(sorted + i);
-	    const char *q = F2(sorted + i);
-	    sum += (sorted + i)->cnt;
-	    print_func(fmt2,
-		t,
-		q,
-		(sorted + i)->cnt,
-		100.0 * (sorted + i)->cnt / base,
-		100.0 * sum / base);
-	}
+        for (i = 0; i < nlines; i++) {
+            const char *t = F2(sorted + i);
+            if (W2 < strlen(t))
+                W2 = strlen(t);
+        }
+        if (W2 + 1 + W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
+            W2 = ncols - 1 - W1 - 1 - WC - 1 - WP - 1 - WP - 1;
+        snprintf(fmt1, 64, "%%-%d.%ds %%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, W2, W2, WC, WP, WP);
+        snprintf(fmt2, 64, "%%-%d.%ds %%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, W2, W2, WC, WP, WP);
+        print_func(fmt1, col1, col2, "Count", "%", "cum%");
+        print_func(fmt1, dashes(W1), dashes(W2), dashes(WC), dashes(WP), dashes(WP));
+        for (i = 0; i < nlines; i++) {
+            const char *t = F1(sorted + i);
+            const char *q = F2(sorted + i);
+            sum += (sorted + i)->cnt;
+            print_func(fmt2,
+                t,
+                q,
+                (sorted + i)->cnt,
+                100.0 * (sorted + i)->cnt / base,
+                100.0 * sum / base);
+        }
     }
 }
 
@@ -1331,16 +1344,16 @@ StringCounter_report(hashtbl * tbl, char *what)
     hash_iter_init(tbl);
     sortsize = 0;
     while ((sc = hash_iterate(tbl))) {
-	sum += sc->count;
-	sortme[sortsize].cnt = sc->count;
-	sortme[sortsize].ptr = sc;
-	sortsize++;
+        sum += sc->count;
+        sortme[sortsize].cnt = sc->count;
+        sortme[sortsize].ptr = sc;
+        sortsize++;
     }
     qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
     Table_report(sortme, sortsize,
-	what, NULL,
-	StringCounter_col_fmt, NULL,
-	sum);
+        what, NULL,
+        StringCounter_col_fmt, NULL,
+        sum);
     free(sortme);
 }
 
@@ -1355,9 +1368,9 @@ void
 Domain_report(void)
 {
     if (cur_level > max_level) {
-	print_func("\tYou must start %s with -l %d\n", progname, cur_level);
-	print_func("\tto collect this level of domain stats.\n", progname);
-	return;
+        print_func("\tYou must start %s with -l %d\n", progname, cur_level);
+        print_func("\tto collect this level of domain stats.\n", progname);
+        return;
     }
     StringCounter_report(Domains[cur_level], "Query Name");
 }
@@ -1376,18 +1389,18 @@ Simple_report(unsigned int a[], unsigned int max, const char *name, strify * to_
     unsigned int sortsize = 0;
     SortItem *sortme = calloc(max, sizeof(SortItem));
     for (i = 0; i < max; i++) {
-	if (0 == a[i])
-	    continue;
-	sum += a[i];
-	sortme[sortsize].cnt = a[i];
-	sortme[sortsize].ptr = to_str(i);
-	sortsize++;
+        if (0 == a[i])
+            continue;
+        sum += a[i];
+        sortme[sortsize].cnt = a[i];
+        sortme[sortsize].ptr = to_str(i);
+        sortsize++;
     }
     qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
     Table_report(sortme, sortsize,
-	name, NULL,
-	Qtype_col_fmt, NULL,
-	sum);
+        name, NULL,
+        Qtype_col_fmt, NULL,
+        sum);
     free(sortme);
 }
 
@@ -1426,16 +1439,16 @@ AgentAddr_report(hashtbl * tbl, const char *what)
     hash_iter_init(tbl);
     sortsize = 0;
     while ((a = hash_iterate(tbl))) {
-	sum += a->count;
-	sortme[sortsize].cnt = a->count;
-	sortme[sortsize].ptr = a;
-	sortsize++;
+        sum += a->count;
+        sortme[sortsize].cnt = a->count;
+        sortme[sortsize].ptr = a;
+        sortsize++;
     }
     qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
     Table_report(sortme, sortsize,
-	what, NULL,
-	AgentAddr_col_fmt, NULL,
-	sum);
+        what, NULL,
+        AgentAddr_col_fmt, NULL,
+        sum);
     free(sortme);
 }
 
@@ -1465,16 +1478,16 @@ StringAddrCounter_report(hashtbl * tbl, char *what1, char *what2)
     hash_iter_init(tbl);
     sortsize = 0;
     while ((ssc = hash_iterate(tbl))) {
-	sum += ssc->count;
-	sortme[sortsize].cnt = ssc->count;
-	sortme[sortsize].ptr = ssc;
-	sortsize++;
+        sum += ssc->count;
+        sortme[sortsize].cnt = ssc->count;
+        sortme[sortsize].ptr = ssc;
+        sortsize++;
     }
     qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
     Table_report(sortme, sortsize,
-	what1, what2,
-	StringAddr_col1_fmt, StringAddr_col2_fmt,
-	sum);
+        what1, what2,
+        StringAddr_col1_fmt, StringAddr_col2_fmt,
+        sum);
     free(sortme);
 }
 
@@ -1482,13 +1495,13 @@ void
 DomSrc_report(void)
 {
     if (0 == opt_count_domsrc) {
-	print_func("\tReport disabled\n");
-	return;
+        print_func("\tReport disabled\n");
+        return;
     }
     if (cur_level > max_level) {
-	print_func("\tYou must start %s with -l %d\n", progname, cur_level);
-	print_func("\tto collect this level of domain stats.\n", progname);
-	return;
+        print_func("\tYou must start %s with -l %d\n", progname, cur_level);
+        print_func("\tto collect this level of domain stats.\n", progname);
+        return;
     }
     StringAddrCounter_report(DomSrcs[cur_level], "Source", "Query Name");
 }
@@ -1513,21 +1526,21 @@ report(void)
     time_t t;
     move(Y, 0);
     if (opt_count_queries) {
-	print_func("Queries: %u new, %u total",
-	    query_count_intvl, query_count_total);
-	if (Got_EOF)
-	    print_func(", EOF");
-	clrtoeol();
-	Y++;
+        print_func("Queries: %u new, %u total",
+            query_count_intvl, query_count_total);
+        if (Got_EOF)
+            print_func(", EOF");
+        clrtoeol();
+        Y++;
     }
     if (opt_count_replies) {
-	move(Y, 0);
-	print_func("Replies: %u new, %u total",
-	    reply_count_intvl, reply_count_total);
-	if (Got_EOF)
-	    print_func(", EOF");
-	clrtoeol();
-	Y++;
+        move(Y, 0);
+        print_func("Replies: %u new, %u total",
+            reply_count_intvl, reply_count_total);
+        if (Got_EOF)
+            print_func(", EOF");
+        clrtoeol();
+        Y++;
     }
     t = time(NULL);
     move(0, get_ncols() - 25);
@@ -1535,8 +1548,164 @@ report(void)
     move(Y + 1, 0);
     clrtobot();
     if (SubReport)
-	SubReport();
+        SubReport();
     refresh();
+}
+
+void
+Table_report_printable(SortItem * sorted, int rows, const char *col1, const char *col2, col_fmt F1, col_fmt F2, unsigned int base)
+{
+    int W1 = strlen(col1);
+    int W2 = col2 ? strlen(col2) : 0;
+    int WC = 9;                 /* width of "Count" column */
+    int WP = 6;                 /* width of "Percent" column */
+    int i;
+    int nlines = get_nlines();
+    int ncols = get_ncols();
+    char fmt1[64];
+    char fmt2[64];
+    unsigned int sum = 0;
+
+    if (nlines > rows)
+        nlines = rows;
+
+    for (i = 0; i < nlines; i++) {
+        const char *t = F1(sorted + i);
+        if (W1 < strlen(t))
+            W1 = strlen(t);
+    }
+    if (W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
+        W1 = ncols - 1 - WC - 1 - WP - 1 - WP - 1;
+
+    // Create file name with timestamp as it's name
+    int ts = (int)time(NULL);
+    char ts_str[ENOUGH];
+    snprintf(ts_str, ENOUGH,"%d", ts);
+
+    // concatenate strings
+    char *file_ext = ".txt";
+    size_t file_length = strlen(file_path) + strlen(ts_str) + strlen(file_ext);
+
+    // plus 2 = extra / and one null byte
+    char file_name[file_length + 2];
+    snprintf(file_name, sizeof file_name, "%s/%s%s", file_path, ts_str, file_ext);
+    // Create file for writing
+    FILE *f = fopen(file_name, "w");
+
+    if (NULL == col2 || NULL == F2) {
+        snprintf(fmt1, 64, "%%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, WC, WP, WP);
+        snprintf(fmt2, 64, "%%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, WC, WP, WP);
+        print_func(fmt1, col1, "Count", "%", "cum%");
+        print_func(fmt1, dashes(W1), dashes(WC), dashes(WP), dashes(WP));
+        for (i = 0; i < nlines; i++) {
+            sum += (sorted + i)->cnt;
+            const char *t = F1(sorted + i);
+            print_func(fmt2,
+                t,
+                (sorted + i)->cnt,
+                100.0 * (sorted + i)->cnt / base,
+                100.0 * sum / base);
+
+            if(f != NULL) {
+                fprintf(f, "%s,%d,%f,%f\n", t, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
+            }
+        }
+    } else {
+        for (i = 0; i < nlines; i++) {
+            const char *t = F2(sorted + i);
+            if (W2 < strlen(t))
+                W2 = strlen(t);
+        }
+        if (W2 + 1 + W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
+            W2 = ncols - 1 - W1 - 1 - WC - 1 - WP - 1 - WP - 1;
+        snprintf(fmt1, 64, "%%-%d.%ds %%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, W2, W2, WC, WP, WP);
+        snprintf(fmt2, 64, "%%-%d.%ds %%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, W2, W2, WC, WP, WP);
+        print_func(fmt1, col1, col2, "Count", "%", "cum%");
+        print_func(fmt1, dashes(W1), dashes(W2), dashes(WC), dashes(WP), dashes(WP));
+        for (i = 0; i < nlines; i++) {
+            const char *t = F1(sorted + i);
+            const char *q = F2(sorted + i);
+            sum += (sorted + i)->cnt;
+            print_func(fmt2,
+                t,
+                q,
+                (sorted + i)->cnt,
+                100.0 * (sorted + i)->cnt / base,
+                100.0 * sum / base);
+
+            if(f != NULL) {
+                fprintf(f, "%s,%s,%d,%f,%f\n", t, q, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
+            }
+        }
+    }
+
+    fclose(f);
+}
+
+void
+StringCounter_report_printable(hashtbl * tbl, char *what)
+{
+    unsigned int sum = 0;
+    int sortsize = hash_count(tbl);
+    SortItem *sortme = calloc(sortsize, sizeof(SortItem));
+    StringCounter *sc;
+    hash_iter_init(tbl);
+    sortsize = 0;
+    while ((sc = hash_iterate(tbl))) {
+        sum += sc->count;
+        sortme[sortsize].cnt = sc->count;
+        sortme[sortsize].ptr = sc;
+        sortsize++;
+    }
+    qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
+    Table_report_printable(sortme, sortsize,
+        what, NULL,
+        StringCounter_col_fmt, NULL,
+        sum);
+    free(sortme);
+}
+
+void
+AgentAddr_report_printable(hashtbl * tbl, const char *what)
+{
+    unsigned int sum = 0;
+    int sortsize = hash_count(tbl);
+    SortItem *sortme = calloc(sortsize, sizeof(SortItem));
+    AgentAddr *a;
+    hash_iter_init(tbl);
+    sortsize = 0;
+    while ((a = hash_iterate(tbl))) {
+        sum += a->count;
+        sortme[sortsize].cnt = a->count;
+        sortme[sortsize].ptr = a;
+        sortsize++;
+    }
+    qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
+    Table_report_printable(sortme, sortsize,
+        what, NULL,
+        AgentAddr_col_fmt, NULL,
+        sum);
+    free(sortme);
+}
+
+
+
+void
+*printable_report(void *args)
+{
+    while(true) {
+        // Call to AgentAddr_report version printable
+        // AgentAddr_report_printable(Sources, "Sources");
+        if(cur_level > max_level) {
+            StringCounter_report_printable(Domains[2], "Query Name");
+        } else {
+            StringCounter_report_printable(Domains[cur_level], "Query Name");
+        }
+
+        sleep(opt_printable_interval);
+    }
+
+    return NULL;
 }
 
 /*
@@ -1551,11 +1720,11 @@ UnknownTldFilter(FilterData * fd)
     const char *tld = QnameToNld(fd->qname, 1);
     unsigned int i;
     if (NULL == tld)
-	return 1;		/* tld is unknown */
+        return 1;               /* tld is unknown */
     for (i = 0; KnownTLDS[i]; i++)
-	if (0 == strcmp(KnownTLDS[i], tld))
-	    return 0;		/* tld is known */
-    return 1;			/* tld is unknown */
+        if (0 == strcmp(KnownTLDS[i], tld))
+            return 0;           /* tld is known */
+    return 1;                   /* tld is unknown */
 }
 
 int
@@ -1563,7 +1732,7 @@ AforAFilter(FilterData * fd)
 {
     struct in_addr a;
     if (fd->qtype != T_A)
-	return 0;
+        return 0;
     return inet_aton(fd->qname, &a);
 }
 
@@ -1574,23 +1743,23 @@ RFC1918PtrFilter(FilterData * fd)
     char q[128];
     unsigned int i = 0;
     if (fd->qtype != T_PTR)
-	return 0;
+        return 0;
     strncpy(q, fd->qname, sizeof(q) - 1);
     q[sizeof(q) - 1] = '\0';
     t = strstr(q, ".in-addr.arpa");
     if (NULL == t)
-	return 0;
+        return 0;
     *t = '\0';
     for (t = strtok(q, "."); t; t = strtok(NULL, ".")) {
-	i >>= 8;
-	i |= ((atoi(t) & 0xff) << 24);
+        i >>= 8;
+        i |= ((atoi(t) & 0xff) << 24);
     }
     if ((i & 0xff000000) == 0x0a000000)
-	return 1;
+        return 1;
     if ((i & 0xfff00000) == 0xac100000)
-	return 1;
+        return 1;
     if ((i & 0xffff0000) == 0xc0a80000)
-	return 1;
+        return 1;
     return 0;
 }
 
@@ -1608,24 +1777,24 @@ QnameFilter(FilterData * fd)
     size_t fo = strlen(F);
     size_t qo = strlen(Q);
     while (qo && fo)
-	if (tolower(Q[--qo]) != tolower(F[--fo]))
-	    return 0;
+        if (tolower(Q[--qo]) != tolower(F[--fo]))
+            return 0;
     if (fo)
-	return 0;		/* didn't match all of opt_filter_by_name */
+        return 0;               /* didn't match all of opt_filter_by_name */
     if (0 == qo)
-	return 1;		/* exact match */
+        return 1;               /* exact match */
     if ('.' == Q[qo - 1])
-	return 1;		/* matched on domain boundary */
+        return 1;               /* matched on domain boundary */
     return 0;
 }
 
 const char* BitsquatNames[] = {
-	"FACEBOOK",
-	"GOOGLE",
-	"YAHOO",
-	"YOUTUBE",
-	"BLOGGER",
-	NULL
+        "FACEBOOK",
+        "GOOGLE",
+        "YAHOO",
+        "YOUTUBE",
+        "BLOGGER",
+        NULL
 };
 
 int
@@ -1636,30 +1805,30 @@ BitsquatFilter(FilterData * fd)
     int i;
     int j;
     if (0 == s)
-	return 0;
+        return 0;
     strncpy(sld, s, sizeof(sld));
     sld[sizeof(sld)-1] = 0;
     if (!strtok(sld, "."))
-	return 0;
+        return 0;
     for (j=0; BitsquatNames[j]; j++)
-	if (0 == strcasecmp(sld, BitsquatNames[j]))
-	    return 0;
+        if (0 == strcasecmp(sld, BitsquatNames[j]))
+            return 0;
     for (i=0; sld[i]; i++) {
-	int k;
-	int save = sld[i];
-	for (k=0; k<8; k++) {
-	    if (5==k)		// upper/lower case bit
-		continue;
-	    int m = 1<<k;
-	    if (sld[i] & m)
-		sld[i] &= ~m;
-	    else
-		sld[i] |= m;
-	    for (j=0; BitsquatNames[j]; j++)
-		if (0 == strcasecmp(sld, BitsquatNames[j]))
-		    return 1;
-	    sld[i] = save;
-	}
+        int k;
+        int save = sld[i];
+        for (k=0; k<8; k++) {
+            if (5==k)           // upper/lower case bit
+                continue;
+            int m = 1<<k;
+            if (sld[i] & m)
+                sld[i] &= ~m;
+            else
+                sld[i] |= m;
+            for (j=0; BitsquatNames[j]; j++)
+                if (0 == strcasecmp(sld, BitsquatNames[j]))
+                    return 1;
+            sld[i] = save;
+        }
     }
     return 0;
 }
@@ -1667,28 +1836,28 @@ BitsquatFilter(FilterData * fd)
 int
 QtypeAnyFilter(FilterData *fd)
 {
-	return fd->qtype == T_ANY;
+        return fd->qtype == T_ANY;
 }
 
 void
 set_filter(const char *fn)
 {
     if (0 == strcmp(fn, "unknown-tlds"))
-	Filter = UnknownTldFilter;
+        Filter = UnknownTldFilter;
     else if (0 == strcmp(fn, "A-for-A"))
-	Filter = AforAFilter;
+        Filter = AforAFilter;
     else if (0 == strcmp(fn, "rfc1918-ptr"))
-	Filter = RFC1918PtrFilter;
+        Filter = RFC1918PtrFilter;
     else if (0 == strcmp(fn, "refused"))
-	Filter = RcodeRefusedFilter;
+        Filter = RcodeRefusedFilter;
     else if (0 == strcmp(fn, "qname"))
-	Filter = QnameFilter;
+        Filter = QnameFilter;
     else if (0 == strcmp(fn, "bitsquat"))
-	Filter = BitsquatFilter;
+        Filter = BitsquatFilter;
     else if (0 == strcmp(fn, "qtype-any"))
-	Filter = QtypeAnyFilter;
+        Filter = QtypeAnyFilter;
     else
-	Filter = NULL;
+        Filter = NULL;
 }
 
 /*
@@ -1709,15 +1878,15 @@ ResetCounters(void)
 {
     int lvl;
     if (NULL == Sources)
-	Sources = hash_create(hash_buckets, my_inXaddr_hash, my_inXaddr_cmp);
+        Sources = hash_create(hash_buckets, my_inXaddr_hash, my_inXaddr_cmp);
     if (NULL == Destinations)
-	Destinations = hash_create(hash_buckets, my_inXaddr_hash, my_inXaddr_cmp);
+        Destinations = hash_create(hash_buckets, my_inXaddr_hash, my_inXaddr_cmp);
     for (lvl = 1; lvl <= max_level; lvl++) {
-	if (NULL != Domains[lvl])
-	    continue;
-	Domains[lvl] = hash_create(hash_buckets, string_hash, string_cmp);
-	if (opt_count_domsrc)
-	    DomSrcs[lvl] = hash_create(hash_buckets, stringaddr_hash, stringaddr_cmp);
+        if (NULL != Domains[lvl])
+            continue;
+        Domains[lvl] = hash_create(hash_buckets, string_hash, string_cmp);
+        if (opt_count_domsrc)
+            DomSrcs[lvl] = hash_create(hash_buckets, stringaddr_hash, stringaddr_cmp);
     }
     query_count_intvl = 0;
     query_count_total = 0;
@@ -1730,9 +1899,9 @@ ResetCounters(void)
     hash_free(Sources, free);
     hash_free(Destinations, free);
     for (lvl = 1; lvl <= max_level; lvl++) {
-	hash_free(Domains[lvl], free);
-	if (opt_count_domsrc)
-	    hash_free(DomSrcs[lvl], StringAddrCounter_free);
+        hash_free(Domains[lvl], free);
+        if (opt_count_domsrc)
+            hash_free(DomSrcs[lvl], StringAddrCounter_free);
     }
     memset(&last_ts, '\0', sizeof(last_ts));
 }
@@ -1741,7 +1910,7 @@ void
 usage(void)
 {
     fprintf(stderr, "usage: %s [opts] netdevice|savefile\n",
-	progname);
+        progname);
     fprintf(stderr, "\t-4\tCount IPv4 packets\n");
     fprintf(stderr, "\t-6\tCount IPv6 packets\n");
     fprintf(stderr, "\t-Q\tCount queries\n");
@@ -1756,6 +1925,8 @@ usage(void)
     fprintf(stderr, "\t-l N\tEnable domain stats up to N components\n");
     fprintf(stderr, "\t-X\tDon't tabulate the \"source + query name\" stats\n");
     fprintf(stderr, "\t-f\tfilter-name\n");
+    fprintf(stderr, "\t-z interval\tAllow report to be saved after each interval in seconds\n");
+    fprintf(stderr, "\t-o dir\tSpecify directory without trailing slash for report above to be saved\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Available filters:\n");
     fprintf(stderr, "\tunknown-tlds\n");
@@ -1788,10 +1959,10 @@ progress(pcap_t * p)
     unsigned int msgs = query_count_total + reply_count_total;
     gettimeofday(&now, NULL);
     if (now.tv_sec == last_progress.tv_sec)
-	return;
+        return;
     time_t wall_elapsed = now.tv_sec - start.tv_sec;
     if (0 == wall_elapsed)
-	return;
+        return;
     double rate = (double)msgs / wall_elapsed;
     fprintf(stderr, "%u %7.1f m/s\n", msgs, rate);
     last_progress = now;
@@ -1815,116 +1986,124 @@ main(int argc, char *argv[])
     memset(rcodes_buf, 0, sizeof(rcodes_buf));
     memset(opcodes_buf, 0, sizeof(opcodes_buf));
 
-    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:pPr:QRvVX")) != -1) {
-	switch (x) {
-	case '4':
-	    opt_count_ipv4 = 1;
-	    break;
-	case '6':
-	    opt_count_ipv6 = 1;
-	    break;
-	case 'a':
-	    anon_flag = 1;
-	    break;
-	case 's':
-	    max_level = 2;
-	    break;
-	case 't':
-	    max_level = 3;
-	    break;
-	case 'l':
-	    max_level = atoi(optarg);
-	    if (max_level < 1 || max_level > 9)
-		usage();
-	    break;
-	case 'n':
-	    opt_filter_by_name = strdup(optarg);
-	    set_filter("qname");
-	    break;
-	case 'p':
-	    promisc_flag = 0;
-	    break;
-	case 'P':
-	    progress_flag = 1;
-	    break;
-	case 'b':
-	    bpf_program_str = strdup(optarg);
-	    break;
-	case 'B':
-	    hash_buckets = atoi(optarg);
-	    break;
-	case 'i':
-	    ignore_list_add_name(optarg);
-	    break;
-	case 'f':
-	    set_filter(optarg);
-	    break;
-	case 'r':
-	    redraw_interval = atoi(optarg);
-	    break;
-	case 'Q':
-	    opt_count_queries = 1;
-	    break;
-	case 'R':
-	    opt_count_replies = 1;
-	    break;
-	case 'v':
-	case 'V':
-	    fprintf(stderr, "dnstop Version: %s\n", Version);
-	    fprintf(stderr, "http://dnstop.measurement-factory.com/\n");
-	    exit(0);
-	case 'X':
-	    opt_count_domsrc = 0;
-	    break;
-	default:
-	    usage();
-	    break;
-	}
+    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:z:o:pPr:QRvVX")) != -1) {
+        switch (x) {
+        case '4':
+            opt_count_ipv4 = 1;
+            break;
+        case '6':
+            opt_count_ipv6 = 1;
+            break;
+        case 'a':
+            anon_flag = 1;
+            break;
+        case 's':
+            max_level = 2;
+            break;
+        case 't':
+            max_level = 3;
+            break;
+        case 'l':
+            max_level = atoi(optarg);
+            if (max_level < 1 || max_level > 9)
+                usage();
+            break;
+        case 'n':
+            opt_filter_by_name = strdup(optarg);
+            set_filter("qname");
+            break;
+        case 'z':
+            printable = 1;
+            opt_printable_interval = atoi(optarg);
+            break;
+        case 'o':
+            printable = 1;
+            file_path = optarg;
+            break;
+        case 'p':
+            promisc_flag = 0;
+            break;
+        case 'P':
+            progress_flag = 1;
+            break;
+        case 'b':
+            bpf_program_str = strdup(optarg);
+            break;
+        case 'B':
+            hash_buckets = atoi(optarg);
+            break;
+        case 'i':
+            ignore_list_add_name(optarg);
+            break;
+        case 'f':
+            set_filter(optarg);
+            break;
+        case 'r':
+            redraw_interval = atoi(optarg);
+            break;
+        case 'Q':
+            opt_count_queries = 1;
+            break;
+        case 'R':
+            opt_count_replies = 1;
+            break;
+        case 'v':
+        case 'V':
+            fprintf(stderr, "dnstop Version: %s\n", Version);
+            fprintf(stderr, "http://dnstop.measurement-factory.com/\n");
+            exit(0);
+        case 'X':
+            opt_count_domsrc = 0;
+            break;
+        default:
+            usage();
+            break;
+        }
     }
     argc -= optind;
     argv += optind;
 
     if (argc < 1)
-	usage();
+        usage();
     device = strdup(argv[0]);
 
     if (!strcasestr(bpf_program_str, "port "))
-    	check_port = htons(53);
+        check_port = htons(53);
     if (0 == opt_count_queries && 0 == opt_count_replies)
-	opt_count_queries = 1;
+        opt_count_queries = 1;
 
     if (0 == opt_count_ipv4 && 0 == opt_count_ipv6)
-	opt_count_ipv4 = opt_count_ipv6 = 1;
+        opt_count_ipv4 = opt_count_ipv6 = 1;
 
     if (0 == stat(device, &sb))
-	readfile_state = 1;
+        readfile_state = 1;
     if (readfile_state) {
-	pcap = pcap_open_offline(device, errbuf);
+        pcap = pcap_open_offline(device, errbuf);
     } else {
-	pcap = pcap_open_live(device, PCAP_SNAPLEN, promisc_flag, 1, errbuf);
+        pcap = pcap_open_live(device, PCAP_SNAPLEN, promisc_flag, 1, errbuf);
     }
     if (NULL == pcap) {
-	fprintf(stderr, "pcap_open_*: %s\n", errbuf);
-	exit(1);
+        fprintf(stderr, "pcap_open_*: %s\n", errbuf);
+        exit(1);
     }
     if (0 == isatty(1) || 0 == isatty(0)) {
-	if (0 == readfile_state) {
-	    fprintf(stderr, "Non-interactive mode requires savefile argument\n");
-	    exit(1);
-	}
-	interactive = 0;
-	print_func = printf;
+        if (0 == readfile_state) {
+            fprintf(stderr, "Non-interactive mode requires savefile argument\n");
+            exit(1);
+        }
+        interactive = 0;
+        print_func = printf;
     }
     memset(&fp, '\0', sizeof(fp));
     x = pcap_compile(pcap, &fp, bpf_program_str, 1, 0);
     if (x < 0) {
-	fprintf(stderr, "pcap_compile failed\n");
-	exit(1);
+        fprintf(stderr, "pcap_compile failed\n");
+        exit(1);
     }
     x = pcap_setfilter(pcap, &fp);
     if (x < 0) {
-	fprintf(stderr, "pcap_setfilter failed\n");
-	exit(1);
+        fprintf(stderr, "pcap_setfilter failed\n");
+        exit(1);
     }
     /*
      * non-blocking call added for Mac OS X bugfix.  Sent by Max Horn. ref
@@ -1937,101 +2116,111 @@ main(int argc, char *argv[])
     pcap_setnonblock(pcap, 1, errbuf);
     switch (pcap_datalink(pcap)) {
     case DLT_EN10MB:
-	handle_datalink = handle_ether;
-	break;
+        handle_datalink = handle_ether;
+        break;
 #ifdef DLT_PPP
 #ifdef HAVE_NET_IF_PPP_H
     case DLT_PPP:
-	handle_datalink = handle_ppp;
-	break;
+        handle_datalink = handle_ppp;
+        break;
 #endif
 #endif
 #ifdef DLT_LOOP
     case DLT_LOOP:
-	handle_datalink = handle_loop;
-	break;
+        handle_datalink = handle_loop;
+        break;
 #endif
 #ifdef DLT_RAW
     case DLT_RAW:
-	handle_datalink = handle_raw;
-	break;
+        handle_datalink = handle_raw;
+        break;
 #endif
 #ifdef DLT_LINUX_SLL
     case DLT_LINUX_SLL:
-	handle_datalink = handle_linux_sll;
-	break;
+        handle_datalink = handle_linux_sll;
+        break;
 #endif
     case DLT_NULL:
-	handle_datalink = handle_null;
-	break;
+        handle_datalink = handle_null;
+        break;
     default:
-	fprintf(stderr, "unsupported data link type %d\n",
-	    pcap_datalink(pcap));
-	return 1;
-	break;
+        fprintf(stderr, "unsupported data link type %d\n",
+            pcap_datalink(pcap));
+        return 1;
+        break;
     }
 
     ResetCounters();
     gettimeofday(&start, NULL);
 
     if (interactive) {
-	init_curses();
-	redraw();
+        init_curses();
+        redraw();
 
-	if (redraw_interval) {
-	    signal(SIGALRM, gotsigalrm);
-	    redraw_itv.it_interval.tv_sec = redraw_interval;
-	    redraw_itv.it_interval.tv_usec = 0;
-	    redraw_itv.it_value.tv_sec = redraw_interval;
-	    redraw_itv.it_value.tv_usec = 0;
-	    setitimer(ITIMER_REAL, &redraw_itv, NULL);
-	}
-	while (0 == Quit) {
-	    if (readfile_state < 2) {
-		/*
-		 * On some OSes select() might return 0 even when there are
-		 * packets to process.  Thus, we always ignore its return value
-		 * and just call pcap_dispatch() anyway.
-		 */
-		if (0 == readfile_state)	/* interactive */
-		    pcap_select(pcap, 1, 0);
-		x = pcap_dispatch(pcap, 50, handle_pcap, NULL);
-	    }
-	    if (0 == x && 1 == readfile_state) {
-		/* block on keyboard until user quits */
-		readfile_state++;
-		nodelay(w, 0);
-		do_redraw = 1;
-		Got_EOF = 1;
-	    }
-	    if (do_redraw || 0 == redraw_interval)
-		redraw();
-	    keyboard();
-	}
-	endwin();		/* klin, Thu Nov 28 08:56:51 2002 */
+        // Spawn new thread for printing report to file
+        pthread_t pth_id;
+        if(printable) {
+            pthread_create(&pth_id, NULL, printable_report, NULL);
+        }
+
+        if (redraw_interval) {
+            signal(SIGALRM, gotsigalrm);
+            redraw_itv.it_interval.tv_sec = redraw_interval;
+            redraw_itv.it_interval.tv_usec = 0;
+            redraw_itv.it_value.tv_sec = redraw_interval;
+            redraw_itv.it_value.tv_usec = 0;
+            setitimer(ITIMER_REAL, &redraw_itv, NULL);
+        }
+        while (0 == Quit) {
+            if (readfile_state < 2) {
+                /*
+                 * On some OSes select() might return 0 even when there are
+                 * packets to process.  Thus, we always ignore its return value
+                 * and just call pcap_dispatch() anyway.
+                 */
+                if (0 == readfile_state)        /* interactive */
+                    pcap_select(pcap, 1, 0);
+                x = pcap_dispatch(pcap, 50, handle_pcap, NULL);
+            }
+            if (0 == x && 1 == readfile_state) {
+                /* block on keyboard until user quits */
+                readfile_state++;
+                nodelay(w, 0);
+                do_redraw = 1;
+                Got_EOF = 1;
+            }
+            if (do_redraw || 0 == redraw_interval)
+                redraw();
+            keyboard();
+        }
+
+        if(printable) {
+            pthread_join(pth_id, NULL);
+        }
+        endwin();               /* klin, Thu Nov 28 08:56:51 2002 */
     } else {
-	while (pcap_dispatch(pcap, 1, handle_pcap, NULL)) {
-	    if (progress_flag && 0 == ((query_count_total + reply_count_total) & 0x3ff))
-		progress(pcap);
-	}
-	cron_pre();
-	Sources_report();
-	print_func("\n");
-	Destinatioreport();
-	print_func("\n");
-	Qtypes_report();
-	print_func("\n");
-	Opcodes_report();
-	print_func("\n");
-	Rcodes_report();
-	for (cur_level = 1; cur_level <= max_level; cur_level++) {
-	    print_func("\n");
-	    Domain_report();
-	}
-	for (cur_level = 1; opt_count_domsrc && cur_level <= max_level; cur_level++) {
-	    print_func("\n");
-	    DomSrc_report();
-	}
+        while (pcap_dispatch(pcap, 1, handle_pcap, NULL)) {
+            if (progress_flag && 0 == ((query_count_total + reply_count_total) & 0x3ff))
+                progress(pcap);
+        }
+        cron_pre();
+        Sources_report();
+        print_func("\n");
+        Destinatioreport();
+        print_func("\n");
+        Qtypes_report();
+        print_func("\n");
+        Opcodes_report();
+        print_func("\n");
+        Rcodes_report();
+        for (cur_level = 1; cur_level <= max_level; cur_level++) {
+            print_func("\n");
+            Domain_report();
+        }
+        for (cur_level = 1; opt_count_domsrc && cur_level <= max_level; cur_level++) {
+            print_func("\n");
+            DomSrc_report();
+        }
     }
 
     pcap_close(pcap);
