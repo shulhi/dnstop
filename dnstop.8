@@ -1,4 +1,4 @@
-.\" $Id: dnstop.8,v 1.28 2012/06/11 20:09:22 wessels Exp $
+.\" $Id: dnstop.8,v 1.29 2014/09/12 22:01:56 wessels Exp $
 .\" 
 .\" manpage written by jose@monkey.org
 .\"
@@ -70,6 +70,11 @@ includes only queries for TLDs that are
 bogus.  Useful for identifying hosts/servers
 that leak queries for things like "localhost"
 or "workgroup."
+.Pp
+The "new-gtlds" filter includes only queries for the
+new gTLD program of 2013/2014.  Useful for identifying
+hosts/servers that use names which may result in future
+collisions and problems when new gTLDs become active.
 .Pp
 The "A-for-A" filter
 includes only A queries for names that are

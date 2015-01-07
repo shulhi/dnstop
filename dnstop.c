@@ -1,5 +1,5 @@
 /*
- * $Id: dnstop.c,v 1.112 2012/06/11 20:09:22 wessels Exp $
+ * $Id: dnstop.c,v 1.118 2014/09/15 17:54:47 wessels Exp $
  *
  * http://dnstop.measurement-factory.com/
  *
@@ -7,7 +7,7 @@
  * the LICENSE file for details.
  */
 
-static const char *Version = "20120611";
+static const char *Version = "20140915";
 
 #include "config.h"
 
@@ -17,9 +17,6 @@ static const char *Version = "20120611";
 #include <fcntl.h>
 
 #include <netinet/in.h>
-
-#include <pthread.h>
-#include <limits.h>
 
 #include <pcap.h>
 #include <signal.h>
@@ -76,8 +73,6 @@ static const char *Version = "20120611";
 #define uh_dport dest
 #define uh_sport source
 #endif
-
-#define ENOUGH (CHAR_BIT * sizeof(int) - 1) / 3 + 2
 
 typedef struct {
     inX_addr src;
@@ -162,14 +157,6 @@ int opt_count_domsrc = 1;
 const char *opt_filter_by_name = 0;
 
 /*
- * Custom flags
- */
-// if set to true, will print report to local disk after set interval
-int printable = 0;
-int opt_printable_interval = 30;
-char *file_path = "/tmp";
-
-/*
  * flags/features for non-interactive mode
  */
 int interactive = 1;
@@ -180,27 +167,6 @@ typedef const char *(col_fmt) (const SortItem *);
 typedef char *(strify) (unsigned int);
 
 #define T_MAX 65536
-#ifndef T_A6
-#define T_A6 38
-#endif
-#ifndef T_SRV
-#define T_SRV 33
-#endif
-#ifndef T_DS
-#define T_DS 43
-#endif
-#ifndef T_RRSIG
-#define T_RRSIG 46
-#endif
-#ifndef T_NSEC
-#define T_NSEC 47
-#endif
-#ifndef T_DNSKEY
-#define T_DNSKEY 48
-#endif
-#ifndef T_SPF
-#define T_SPF 99
-#endif
 #define C_MAX 65536
 #define OP_MAX 16
 #define RC_MAX 16
@@ -219,6 +185,8 @@ hashtbl *Sources = NULL;
 hashtbl *Destinations = NULL;
 hashtbl *Domains[10];
 hashtbl *DomSrcs[10];
+hashtbl *KnownTLDs = NULL;
+hashtbl *NewGTLDs = NULL;
 
 #ifdef HAVE_STRUCT_BPF_TIMEVAL
 struct bpf_timeval last_ts;
@@ -360,12 +328,12 @@ allocate_anonymous_address(inX_addr * anon_addr, const inX_addr * orig_addr)
         ptr->addr = *orig_addr;
         ptr->data = (void *)(ptr + 1);
         if (4 == inXaddr_version(orig_addr)) {
-            read(entropy_fd, buf, 4);
+            (void) read(entropy_fd, buf, 4);
             inXaddr_assign_v4(ptr->data, (struct in_addr *)buf);
         }
 #if USE_IPV6
         else {
-            read(entropy_fd, buf, 16);
+            (void) read(entropy_fd, buf, 16);
             inXaddr_assign_v6(ptr->data, (struct in6_addr *)buf);
         }
 #endif
@@ -564,6 +532,15 @@ QnameToNld(const char *qname, int nld)
     return t;
 }
 
+char *
+str_tolower(char *s)
+{
+    char *t;
+    for (t = s; *t; t++)
+        *t = tolower(*t);
+    return s;
+}
+
 int
 handle_dns(const char *buf, int len,
     const inX_addr * src_addr,
@@ -625,8 +602,7 @@ handle_dns(const char *buf, int len,
         *t = ' ';
     while ((t = strchr(qname, '\r')))
         *t = ' ';
-    for (t = qname; *t; t++)
-        *t = tolower(*t);
+    str_tolower(qname);
 
     memcpy(&us, buf + offset, 2);
     qtype = ntohs(us);
@@ -1105,11 +1081,17 @@ qtype_str(unsigned int t)
     case T_PTR:
         return "PTR?";
         break;
+    case 13:
+        return "HINFO?";
+        break;
     case T_MX:
         return "MX?";
         break;
     case T_TXT:
         return "TXT?";
+        break;
+    case 18:
+        return "AFSDB?";
         break;
     case T_SIG:
         return "SIG?";
@@ -1117,35 +1099,59 @@ qtype_str(unsigned int t)
     case T_KEY:
         return "KEY?";
         break;
+    case 26:
+        return "PX?";
+        break;
     case T_AAAA:
         return "AAAA?";
         break;
     case T_LOC:
         return "LOC?";
         break;
-    case T_SRV:
+    case 33:
         return "SRV?";
         break;
-    case T_A6:
+    case 35:
+        return "NAPTR?";
+        break;
+    case 38:
         return "A6?";
         break;
-    case T_DS:
+    case 41:
+        return "OPT?";
+        break;
+    case 43:
         return "DS?";
         break;
-    case T_RRSIG:
+    case 44:
+        return "SSHFP?";
+        break;
+    case 46:
         return "RRSIG?";
         break;
-    case T_NSEC:
+    case 47:
         return "NSEC?";
         break;
-    case T_DNSKEY:
+    case 48:
         return "DNSKEY?";
         break;
-    case T_SPF:
+    case 50:
+        return "NSEC3?";
+        break;
+    case 51:
+        return "NSEC3PARAM?";
+        break;
+    case 52:
+        return "TLSA?";
+        break;
+    case 99:
         return "SPF?";
         break;
     case T_ANY:
         return "ANY?";
+        break;
+    case 32769:
+        return "DLV?";
         break;
     default:
         if (qtypes_buf[t])
@@ -1382,14 +1388,14 @@ Qtype_col_fmt(const SortItem * si)
 }
 
 void
-Simple_report(unsigned int a[], unsigned int max, const char *name, strify * to_str)
+Simple_report(int a[], unsigned int max, const char *name, strify * to_str)
 {
     unsigned int i;
     unsigned int sum = 0;
     unsigned int sortsize = 0;
     SortItem *sortme = calloc(max, sizeof(SortItem));
     for (i = 0; i < max; i++) {
-        if (0 == a[i])
+        if (0 >= a[i])
             continue;
         sum += a[i];
         sortme[sortsize].cnt = a[i];
@@ -1552,167 +1558,24 @@ report(void)
     refresh();
 }
 
-void
-Table_report_printable(SortItem * sorted, int rows, const char *col1, const char *col2, col_fmt F1, col_fmt F2, unsigned int base)
-{
-    int W1 = strlen(col1);
-    int W2 = col2 ? strlen(col2) : 0;
-    int WC = 9;                 /* width of "Count" column */
-    int WP = 6;                 /* width of "Percent" column */
-    int i;
-    int nlines = get_nlines();
-    int ncols = get_ncols();
-    char fmt1[64];
-    char fmt2[64];
-    unsigned int sum = 0;
-
-    if (nlines > rows)
-        nlines = rows;
-
-    for (i = 0; i < nlines; i++) {
-        const char *t = F1(sorted + i);
-        if (W1 < strlen(t))
-            W1 = strlen(t);
-    }
-    if (W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
-        W1 = ncols - 1 - WC - 1 - WP - 1 - WP - 1;
-
-    // Create file name with timestamp as it's name
-    int ts = (int)time(NULL);
-    char ts_str[ENOUGH];
-    snprintf(ts_str, ENOUGH,"%d", ts);
-
-    // concatenate strings
-    char *file_ext = ".txt";
-    size_t file_length = strlen(file_path) + strlen(ts_str) + strlen(file_ext);
-
-    // plus 2 = extra / and one null byte
-    char file_name[file_length + 2];
-    snprintf(file_name, sizeof file_name, "%s/%s%s", file_path, ts_str, file_ext);
-    // Create file for writing
-    FILE *f = fopen(file_name, "w");
-
-    if (NULL == col2 || NULL == F2) {
-        snprintf(fmt1, 64, "%%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, WC, WP, WP);
-        snprintf(fmt2, 64, "%%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, WC, WP, WP);
-        print_func(fmt1, col1, "Count", "%", "cum%");
-        print_func(fmt1, dashes(W1), dashes(WC), dashes(WP), dashes(WP));
-        for (i = 0; i < nlines; i++) {
-            sum += (sorted + i)->cnt;
-            const char *t = F1(sorted + i);
-            print_func(fmt2,
-                t,
-                (sorted + i)->cnt,
-                100.0 * (sorted + i)->cnt / base,
-                100.0 * sum / base);
-
-            if(f != NULL) {
-                fprintf(f, "%s,%d,%f,%f\n", t, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
-            }
-        }
-    } else {
-        for (i = 0; i < nlines; i++) {
-            const char *t = F2(sorted + i);
-            if (W2 < strlen(t))
-                W2 = strlen(t);
-        }
-        if (W2 + 1 + W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
-            W2 = ncols - 1 - W1 - 1 - WC - 1 - WP - 1 - WP - 1;
-        snprintf(fmt1, 64, "%%-%d.%ds %%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, W2, W2, WC, WP, WP);
-        snprintf(fmt2, 64, "%%-%d.%ds %%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, W2, W2, WC, WP, WP);
-        print_func(fmt1, col1, col2, "Count", "%", "cum%");
-        print_func(fmt1, dashes(W1), dashes(W2), dashes(WC), dashes(WP), dashes(WP));
-        for (i = 0; i < nlines; i++) {
-            const char *t = F1(sorted + i);
-            const char *q = F2(sorted + i);
-            sum += (sorted + i)->cnt;
-            print_func(fmt2,
-                t,
-                q,
-                (sorted + i)->cnt,
-                100.0 * (sorted + i)->cnt / base,
-                100.0 * sum / base);
-
-            if(f != NULL) {
-                fprintf(f, "%s,%s,%d,%f,%f\n", t, q, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
-            }
-        }
-    }
-
-    fclose(f);
-}
-
-void
-StringCounter_report_printable(hashtbl * tbl, char *what)
-{
-    unsigned int sum = 0;
-    int sortsize = hash_count(tbl);
-    SortItem *sortme = calloc(sortsize, sizeof(SortItem));
-    StringCounter *sc;
-    hash_iter_init(tbl);
-    sortsize = 0;
-    while ((sc = hash_iterate(tbl))) {
-        sum += sc->count;
-        sortme[sortsize].cnt = sc->count;
-        sortme[sortsize].ptr = sc;
-        sortsize++;
-    }
-    qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
-    Table_report_printable(sortme, sortsize,
-        what, NULL,
-        StringCounter_col_fmt, NULL,
-        sum);
-    free(sortme);
-}
-
-void
-AgentAddr_report_printable(hashtbl * tbl, const char *what)
-{
-    unsigned int sum = 0;
-    int sortsize = hash_count(tbl);
-    SortItem *sortme = calloc(sortsize, sizeof(SortItem));
-    AgentAddr *a;
-    hash_iter_init(tbl);
-    sortsize = 0;
-    while ((a = hash_iterate(tbl))) {
-        sum += a->count;
-        sortme[sortsize].cnt = a->count;
-        sortme[sortsize].ptr = a;
-        sortsize++;
-    }
-    qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
-    Table_report_printable(sortme, sortsize,
-        what, NULL,
-        AgentAddr_col_fmt, NULL,
-        sum);
-    free(sortme);
-}
-
-
-
-void
-*printable_report(void *args)
-{
-    while(true) {
-        // Call to AgentAddr_report version printable
-        // AgentAddr_report_printable(Sources, "Sources");
-        if(cur_level > max_level) {
-            StringCounter_report_printable(Domains[2], "Query Name");
-        } else {
-            StringCounter_report_printable(Domains[cur_level], "Query Name");
-        }
-
-        sleep(opt_printable_interval);
-    }
-
-    return NULL;
-}
-
 /*
  * === BEGIN FILTERS ==========================================================
  */
 
 #include "known_tlds.h"
+#include "new_gtlds.h"
+
+void
+array_to_hash(const char *array[], hashtbl *hash)
+{
+        int i;
+        for (i = 0; array[i]; i++) {
+                char *s = strdup(array[i]);
+                assert(s);
+                str_tolower(s);
+                hash_add(s, s, hash);
+        }
+}
 
 int
 UnknownTldFilter(FilterData * fd)
@@ -1721,10 +1584,21 @@ UnknownTldFilter(FilterData * fd)
     unsigned int i;
     if (NULL == tld)
         return 1;               /* tld is unknown */
-    for (i = 0; KnownTLDS[i]; i++)
-        if (0 == strcmp(KnownTLDS[i], tld))
-            return 0;           /* tld is known */
+    if (hash_find(tld, KnownTLDs))
+        return 0;               /* tld is known */
     return 1;                   /* tld is unknown */
+}
+
+int
+NewGTldFilter(FilterData * fd)
+{
+    const char *tld = QnameToNld(fd->qname, 1);
+    unsigned int i;
+    if (NULL == tld)
+        return 0;               /* tld is unknown */
+    if (hash_find(tld, NewGTLDs))
+        return 1;               /* tld is new */
+    return 0;                   /* tld is old */
 }
 
 int
@@ -1844,6 +1718,8 @@ set_filter(const char *fn)
 {
     if (0 == strcmp(fn, "unknown-tlds"))
         Filter = UnknownTldFilter;
+    if (0 == strcmp(fn, "new-gtlds"))
+        Filter = NewGTldFilter;
     else if (0 == strcmp(fn, "A-for-A"))
         Filter = AforAFilter;
     else if (0 == strcmp(fn, "rfc1918-ptr"))
@@ -1925,8 +1801,6 @@ usage(void)
     fprintf(stderr, "\t-l N\tEnable domain stats up to N components\n");
     fprintf(stderr, "\t-X\tDon't tabulate the \"source + query name\" stats\n");
     fprintf(stderr, "\t-f\tfilter-name\n");
-    fprintf(stderr, "\t-z interval\tAllow report to be saved after each interval in seconds\n");
-    fprintf(stderr, "\t-o dir\tSpecify directory without trailing slash for report above to be saved\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Available filters:\n");
     fprintf(stderr, "\tunknown-tlds\n");
@@ -1986,7 +1860,12 @@ main(int argc, char *argv[])
     memset(rcodes_buf, 0, sizeof(rcodes_buf));
     memset(opcodes_buf, 0, sizeof(opcodes_buf));
 
-    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:z:o:pPr:QRvVX")) != -1) {
+    KnownTLDs = hash_create(hash_buckets, string_hash, string_cmp);
+    NewGTLDs = hash_create(hash_buckets, string_hash, string_cmp);
+    array_to_hash(KnownTLDs_array, KnownTLDs);
+    array_to_hash(NewGTLDs_array, NewGTLDs);
+
+    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:pPr:QRvVX")) != -1) {
         switch (x) {
         case '4':
             opt_count_ipv4 = 1;
@@ -2011,14 +1890,6 @@ main(int argc, char *argv[])
         case 'n':
             opt_filter_by_name = strdup(optarg);
             set_filter("qname");
-            break;
-        case 'z':
-            printable = 1;
-            opt_printable_interval = atoi(optarg);
-            break;
-        case 'o':
-            printable = 1;
-            file_path = optarg;
             break;
         case 'p':
             promisc_flag = 0;
@@ -2067,13 +1938,18 @@ main(int argc, char *argv[])
         usage();
     device = strdup(argv[0]);
 
-    if (!strcasestr(bpf_program_str, "port "))
+    if (!strstr(bpf_program_str, "port "))
         check_port = htons(53);
     if (0 == opt_count_queries && 0 == opt_count_replies)
         opt_count_queries = 1;
 
     if (0 == opt_count_ipv4 && 0 == opt_count_ipv6)
         opt_count_ipv4 = opt_count_ipv6 = 1;
+
+    if (RcodeRefusedFilter == Filter) {
+        opt_count_queries = 0;
+        opt_count_replies = 1;
+    }
 
     if (0 == stat(device, &sb))
         readfile_state = 1;
@@ -2157,12 +2033,6 @@ main(int argc, char *argv[])
         init_curses();
         redraw();
 
-        // Spawn new thread for printing report to file
-        pthread_t pth_id;
-        if(printable) {
-            pthread_create(&pth_id, NULL, printable_report, NULL);
-        }
-
         if (redraw_interval) {
             signal(SIGALRM, gotsigalrm);
             redraw_itv.it_interval.tv_sec = redraw_interval;
@@ -2192,10 +2062,6 @@ main(int argc, char *argv[])
             if (do_redraw || 0 == redraw_interval)
                 redraw();
             keyboard();
-        }
-
-        if(printable) {
-            pthread_join(pth_id, NULL);
         }
         endwin();               /* klin, Thu Nov 28 08:56:51 2002 */
     } else {
