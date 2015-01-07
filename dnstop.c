@@ -18,6 +18,9 @@ static const char *Version = "20140915";
 
 #include <netinet/in.h>
 
+#include <pthread.h>
+#include <limits.h>
+
 #include <pcap.h>
 #include <signal.h>
 #include <stdio.h>
@@ -155,6 +158,14 @@ int opt_count_ipv4 = 0;
 int opt_count_ipv6 = 0;
 int opt_count_domsrc = 1;
 const char *opt_filter_by_name = 0;
+
+/*
+ * Custom flags
+ */
+// if set to true, will print report to local disk after set interval
+int printable = 0;
+int opt_printable_interval = 30;
+char *file_path = "/tmp";
 
 /*
  * flags/features for non-interactive mode
@@ -1558,6 +1569,162 @@ report(void)
     refresh();
 }
 
+void
+Table_report_printable(SortItem * sorted, int rows, const char *col1, const char *col2, col_fmt F1, col_fmt F2, unsigned int base)
+{
+    int W1 = strlen(col1);
+    int W2 = col2 ? strlen(col2) : 0;
+    int WC = 9;                 /* width of "Count" column */
+    int WP = 6;                 /* width of "Percent" column */
+    int i;
+    int nlines = get_nlines();
+    int ncols = get_ncols();
+    char fmt1[64];
+    char fmt2[64];
+    unsigned int sum = 0;
+
+    if (nlines > rows)
+        nlines = rows;
+
+    for (i = 0; i < nlines; i++) {
+        const char *t = F1(sorted + i);
+        if (W1 < strlen(t))
+            W1 = strlen(t);
+    }
+    if (W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
+        W1 = ncols - 1 - WC - 1 - WP - 1 - WP - 1;
+
+    // Create file name with timestamp as it's name
+    int ts = (int)time(NULL);
+    char ts_str[ENOUGH];
+    snprintf(ts_str, ENOUGH,"%d", ts);
+
+    // concatenate strings
+    char *file_ext = ".txt";
+    size_t file_length = strlen(file_path) + strlen(ts_str) + strlen(file_ext);
+
+    // plus 2 = extra / and one null byte
+    char file_name[file_length + 2];
+    snprintf(file_name, sizeof file_name, "%s/%s%s", file_path, ts_str, file_ext);
+    // Create file for writing
+    FILE *f = fopen(file_name, "w");
+
+    if (NULL == col2 || NULL == F2) {
+        snprintf(fmt1, 64, "%%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, WC, WP, WP);
+        snprintf(fmt2, 64, "%%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, WC, WP, WP);
+        print_func(fmt1, col1, "Count", "%", "cum%");
+        print_func(fmt1, dashes(W1), dashes(WC), dashes(WP), dashes(WP));
+        for (i = 0; i < nlines; i++) {
+            sum += (sorted + i)->cnt;
+            const char *t = F1(sorted + i);
+            print_func(fmt2,
+                t,
+                (sorted + i)->cnt,
+                100.0 * (sorted + i)->cnt / base,
+                100.0 * sum / base);
+
+            if(f != NULL) {
+                fprintf(f, "%s,%d,%f,%f\n", t, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
+            }
+        }
+    } else {
+        for (i = 0; i < nlines; i++) {
+            const char *t = F2(sorted + i);
+            if (W2 < strlen(t))
+                W2 = strlen(t);
+        }
+        if (W2 + 1 + W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
+            W2 = ncols - 1 - W1 - 1 - WC - 1 - WP - 1 - WP - 1;
+        snprintf(fmt1, 64, "%%-%d.%ds %%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, W2, W2, WC, WP, WP);
+        snprintf(fmt2, 64, "%%-%d.%ds %%-%d.%ds %%%dd %%%d.1f %%%d.1f\n", W1, W1, W2, W2, WC, WP, WP);
+        print_func(fmt1, col1, col2, "Count", "%", "cum%");
+        print_func(fmt1, dashes(W1), dashes(W2), dashes(WC), dashes(WP), dashes(WP));
+        for (i = 0; i < nlines; i++) {
+            const char *t = F1(sorted + i);
+            const char *q = F2(sorted + i);
+            sum += (sorted + i)->cnt;
+            print_func(fmt2,
+                t,
+                q,
+                (sorted + i)->cnt,
+                100.0 * (sorted + i)->cnt / base,
+                100.0 * sum / base);
+
+            if(f != NULL) {
+                fprintf(f, "%s,%s,%d,%f,%f\n", t, q, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
+            }
+        }
+    }
+
+    fclose(f);
+}
+
+void
+StringCounter_report_printable(hashtbl * tbl, char *what)
+{
+    unsigned int sum = 0;
+    int sortsize = hash_count(tbl);
+    SortItem *sortme = calloc(sortsize, sizeof(SortItem));
+    StringCounter *sc;
+    hash_iter_init(tbl);
+    sortsize = 0;
+    while ((sc = hash_iterate(tbl))) {
+        sum += sc->count;
+        sortme[sortsize].cnt = sc->count;
+        sortme[sortsize].ptr = sc;
+        sortsize++;
+    }
+    qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
+    Table_report_printable(sortme, sortsize,
+        what, NULL,
+        StringCounter_col_fmt, NULL,
+        sum);
+    free(sortme);
+}
+
+void
+AgentAddr_report_printable(hashtbl * tbl, const char *what)
+{
+    unsigned int sum = 0;
+    int sortsize = hash_count(tbl);
+    SortItem *sortme = calloc(sortsize, sizeof(SortItem));
+    AgentAddr *a;
+    hash_iter_init(tbl);
+    sortsize = 0;
+    while ((a = hash_iterate(tbl))) {
+        sum += a->count;
+        sortme[sortsize].cnt = a->count;
+        sortme[sortsize].ptr = a;
+        sortsize++;
+    }
+    qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
+    Table_report_printable(sortme, sortsize,
+        what, NULL,
+        AgentAddr_col_fmt, NULL,
+        sum);
+    free(sortme);
+}
+
+
+
+void
+*printable_report(void *args)
+{
+    while(true) {
+        // Call to AgentAddr_report version printable
+        // AgentAddr_report_printable(Sources, "Sources");
+        if(cur_level > max_level) {
+            StringCounter_report_printable(Domains[2], "Query Name");
+        } else {
+            StringCounter_report_printable(Domains[cur_level], "Query Name");
+        }
+
+        sleep(opt_printable_interval);
+    }
+
+    return NULL;
+}
+
 /*
  * === BEGIN FILTERS ==========================================================
  */
@@ -1801,6 +1968,8 @@ usage(void)
     fprintf(stderr, "\t-l N\tEnable domain stats up to N components\n");
     fprintf(stderr, "\t-X\tDon't tabulate the \"source + query name\" stats\n");
     fprintf(stderr, "\t-f\tfilter-name\n");
+    fprintf(stderr, "\t-z interval\tSave report to disk after each interval as specified. Interval is in seconds. Default is 30 seconds.\n");
+    fprintf(stderr, "\t-o dir\t Specify directory without trailing slash for report to be saved. Default is /tmp\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Available filters:\n");
     fprintf(stderr, "\tunknown-tlds\n");
@@ -1865,7 +2034,7 @@ main(int argc, char *argv[])
     array_to_hash(KnownTLDs_array, KnownTLDs);
     array_to_hash(NewGTLDs_array, NewGTLDs);
 
-    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:pPr:QRvVX")) != -1) {
+    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:z:o:pPr:QRvVX")) != -1) {
         switch (x) {
         case '4':
             opt_count_ipv4 = 1;
@@ -1890,6 +2059,14 @@ main(int argc, char *argv[])
         case 'n':
             opt_filter_by_name = strdup(optarg);
             set_filter("qname");
+            break;
+        case 'z':
+            printable = 1;
+            opt_printable_interval = atoi(optarg);
+            break;
+        case 'o':
+            printable = 1;
+            file_path = optarg;
             break;
         case 'p':
             promisc_flag = 0;
@@ -2033,6 +2210,12 @@ main(int argc, char *argv[])
         init_curses();
         redraw();
 
+        // Spawn new thread for printing report to file
+        pthread_t pth_id;
+        if(printable) {
+            pthread_create(&pth_id, NULL, printable_report, NULL);
+        }
+
         if (redraw_interval) {
             signal(SIGALRM, gotsigalrm);
             redraw_itv.it_interval.tv_sec = redraw_interval;
@@ -2062,6 +2245,10 @@ main(int argc, char *argv[])
             if (do_redraw || 0 == redraw_interval)
                 redraw();
             keyboard();
+        }
+
+        if(printable) {
+            pthread_join(pth_id, NULL);
         }
         endwin();               /* klin, Thu Nov 28 08:56:51 2002 */
     } else {
