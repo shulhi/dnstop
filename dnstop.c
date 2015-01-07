@@ -1925,6 +1925,8 @@ usage(void)
     fprintf(stderr, "\t-l N\tEnable domain stats up to N components\n");
     fprintf(stderr, "\t-X\tDon't tabulate the \"source + query name\" stats\n");
     fprintf(stderr, "\t-f\tfilter-name\n");
+    fprintf(stderr, "\t-z interval\tAllow report to be saved after each interval in seconds\n");
+    fprintf(stderr, "\t-o dir\tSpecify directory without trailing slash for report above to be saved\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Available filters:\n");
     fprintf(stderr, "\tunknown-tlds\n");
