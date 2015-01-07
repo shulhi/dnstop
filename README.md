@@ -17,7 +17,7 @@ $ make all
 Note that you might need to change the `Makefile` generated after running the configure to include `-lpthread` flag under the `LIBS`.
 
 # Extra options
-Additional feature is able to save the report in comma separated value for query name report. This is run every 30s or after user defined interval to `/tmp` or user defined location. 
+Additional feature is able to save the report in comma separated value for query name report. This is run every 30s or after user defined interval to `/tmp` or user defined location. Report is run on a different thread, so it does not block the main thread from continuing.
 
 Why? Current build from original author does not allow interactive tty to be piped/redirected to file. I need to run a report based on this, thus the workaround.
 
