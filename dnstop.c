@@ -1598,7 +1598,7 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
                 100.0 * sum / base);
 
             if(f != NULL) {
-                fprintf(f, "%s,%d,%d,%d\n", t, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
+                fprintf(f, "%s,%d,%f,%f\n", t, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
             }
         }
     } else {
@@ -1625,7 +1625,7 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
                 100.0 * sum / base);
 
             if(f != NULL) {
-                fprintf(f, "%s,%s,%d,%d,%d\n", t, q, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
+                fprintf(f, "%s,%s,%d,%f,%f\n", t, q, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
             }
         }
     }
