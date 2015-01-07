@@ -77,6 +77,8 @@ static const char *Version = "20140915";
 #define uh_sport source
 #endif
 
+#define ENOUGH (CHAR_BIT * sizeof(int) - 1) / 3 + 2
+
 typedef struct {
     inX_addr src;
     int count;
