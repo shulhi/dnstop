@@ -162,6 +162,13 @@ int opt_count_domsrc = 1;
 const char *opt_filter_by_name = 0;
 
 /*
+ * Custom flags
+ */
+// if set to true, will print report to local disk after set interval
+int printable = 0;
+int opt_printable_interval = 30;
+
+/*
  * flags/features for non-interactive mode
  */
 int interactive = 1;
@@ -1688,7 +1695,7 @@ void
         // Call to AgentAddr_report version printable
         // AgentAddr_report_printable(Sources, "Sources");
         StringCounter_report_printable(Domains[2], "Query Name");
-        sleep(10);
+        sleep(opt_printable_interval);
     }
 
     return NULL;
@@ -1970,7 +1977,7 @@ main(int argc, char *argv[])
     memset(rcodes_buf, 0, sizeof(rcodes_buf));
     memset(opcodes_buf, 0, sizeof(opcodes_buf));
 
-    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:pPr:QRvVX")) != -1) {
+    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:z:pPr:QRvVX")) != -1) {
         switch (x) {
         case '4':
             opt_count_ipv4 = 1;
@@ -1995,6 +2002,10 @@ main(int argc, char *argv[])
         case 'n':
             opt_filter_by_name = strdup(optarg);
             set_filter("qname");
+            break;
+        case 'z':
+            printable = 1;
+            opt_printable_interval = atoi(optarg);
             break;
         case 'p':
             promisc_flag = 0;
@@ -2135,7 +2146,9 @@ main(int argc, char *argv[])
 
         // Spawn new thread for printing report to file
         pthread_t pth_id;
-        pthread_create(&pth_id, NULL, printable_report, NULL);
+        if(printable) {
+            pthread_create(&pth_id, NULL, printable_report, NULL);
+        }
 
         if (redraw_interval) {
             signal(SIGALRM, gotsigalrm);
@@ -2168,7 +2181,9 @@ main(int argc, char *argv[])
             keyboard();
         }
 
-        pthread_join(pth_id, NULL);
+        if(printable) {
+            pthread_join(pth_id, NULL);
+        }
         endwin();               /* klin, Thu Nov 28 08:56:51 2002 */
     } else {
         while (pcap_dispatch(pcap, 1, handle_pcap, NULL)) {
