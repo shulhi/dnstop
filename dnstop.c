@@ -167,6 +167,7 @@ const char *opt_filter_by_name = 0;
 // if set to true, will print report to local disk after set interval
 int printable = 0;
 int opt_printable_interval = 30;
+char *file_path = "/tmp";
 
 /*
  * flags/features for non-interactive mode
@@ -1582,11 +1583,11 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
     snprintf(ts_str, ENOUGH,"%d", ts);
 
     // concatenate strings
-    char *file_path = "/tmp/";
     char *file_ext = ".txt";
+    size_t file_length = strlen(file_path) + strlen(ts_str) + strlen(file_ext);
 
-    char file_name[256];
-    snprintf(file_name, sizeof file_name, "%s%s%s", file_path, ts_str, file_ext);
+    char file_name[file_length];
+    snprintf(file_name, sizeof file_name, "%s/%s%s", file_path, ts_str, file_ext);
     // Create file for writing
     FILE *f = fopen(file_name, "w");
 
@@ -1977,7 +1978,7 @@ main(int argc, char *argv[])
     memset(rcodes_buf, 0, sizeof(rcodes_buf));
     memset(opcodes_buf, 0, sizeof(opcodes_buf));
 
-    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:z:pPr:QRvVX")) != -1) {
+    while ((x = getopt(argc, argv, "46ab:B:f:i:l:n:z:o:pPr:QRvVX")) != -1) {
         switch (x) {
         case '4':
             opt_count_ipv4 = 1;
@@ -2006,6 +2007,10 @@ main(int argc, char *argv[])
         case 'z':
             printable = 1;
             opt_printable_interval = atoi(optarg);
+            break;
+        case 'o':
+            printable = 1;
+            file_path = optarg;
             break;
         case 'p':
             promisc_flag = 0;
