@@ -17,6 +17,7 @@ SRCS=	$(PROG).c \
 	hashtbl.c hashtbl.h \
 	inX_addr.c inX_addr.h \
 	known_tlds.h \
+	new_gtlds.h \
 	lookup3.c
 
 OBJS=	$(PROG).o \
@@ -28,9 +29,6 @@ all: $(PROG)
 
 $(PROG): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) ${LIBS}
-
-dnstop.o: dnstop.c
-	$(CC) $(CFLAGS) -c $<
 
 clean:
 	rm -f $(PROG) $(OBJS) $(PROG).core $(PROG).c~
@@ -48,6 +46,7 @@ tar:
 	mkdir $(PROG)-$$DATE && \
 	cp -p LICENSE CHANGES $(SRCS) $(PROG).8 $(PROG)-$$DATE && \
 	cp -p configure Makefile.in config.h.in install-sh $(PROG)-$$DATE && \
+	cp -p configure.scan $(PROG)-$$DATE/configure.ac && \
 	perl -pi -e "s/\@VERSION\@/$$DATE/" $(PROG)-$$DATE/dnstop.c && \
 	tar czvf $(PROG)-$$DATE.tar.gz $(PROG)-$$DATE && \
 	chmod 444 $(PROG)-$$DATE.tar.gz && \
