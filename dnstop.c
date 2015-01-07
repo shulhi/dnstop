@@ -1696,7 +1696,12 @@ void
     while(true) {
         // Call to AgentAddr_report version printable
         // AgentAddr_report_printable(Sources, "Sources");
-        StringCounter_report_printable(Domains[2], "Query Name");
+        if(cur_level > max_level) {
+            StringCounter_report_printable(Domains[2], "Query Name");
+        } else {
+            StringCounter_report_printable(Domains[cur_level], "Query Name");
+        }
+
         sleep(opt_printable_interval);
     }
 
