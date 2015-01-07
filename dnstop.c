@@ -19,6 +19,7 @@ static const char *Version = "20120611";
 #include <netinet/in.h>
 
 #include <pthread.h>
+#include <limits.h>
 
 #include <pcap.h>
 #include <signal.h>
@@ -75,6 +76,8 @@ static const char *Version = "20120611";
 #define uh_dport dest
 #define uh_sport source
 #endif
+
+#define ENOUGH (CHAR_BIT * sizeof(int) - 1) / 3 + 2
 
 typedef struct {
     inX_addr src;
@@ -1566,8 +1569,19 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
     if (W1 + 1 + WC + 1 + WP + 1 + WP + 1 > ncols)
         W1 = ncols - 1 - WC - 1 - WP - 1 - WP - 1;
 
+    // Create file name with timestamp as it's name
+    int ts = (int)time(NULL);
+    char ts_str[ENOUGH];
+    snprintf(ts_str, ENOUGH,"%d", ts);
+
+    // concatenate strings
+    char *file_path = "/tmp/";
+    char *file_ext = ".txt";
+
+    char file_name[256];
+    snprintf(file_name, sizeof file_name, "%s%s%s", file_path, ts_str, file_ext);
     // Create file for writing
-    FILE *f = fopen("/tmp/dnstop.txt", "a");
+    FILE *f = fopen(file_name, "w");
 
     if (NULL == col2 || NULL == F2) {
         snprintf(fmt1, 64, "%%-%d.%ds %%%ds %%%ds %%%ds\n", W1, W1, WC, WP, WP);
@@ -1584,7 +1598,7 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
                 100.0 * sum / base);
 
             if(f != NULL) {
-                fprintf(f, "%s\n", t);
+                fprintf(f, "%s,%d,%d,%d\n", t, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
             }
         }
     } else {
@@ -1611,12 +1625,35 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
                 100.0 * sum / base);
 
             if(f != NULL) {
-                fprintf(f, "%s\n", t);
+                fprintf(f, "%s,%s,%d,%d,%d\n", t, q, (sorted + i)->cnt, 100.0 * (sorted + i)->cnt / base, 100.0 * sum / base);
             }
         }
     }
 
     fclose(f);
+}
+
+void
+StringCounter_report_printable(hashtbl * tbl, char *what)
+{
+    unsigned int sum = 0;
+    int sortsize = hash_count(tbl);
+    SortItem *sortme = calloc(sortsize, sizeof(SortItem));
+    StringCounter *sc;
+    hash_iter_init(tbl);
+    sortsize = 0;
+    while ((sc = hash_iterate(tbl))) {
+        sum += sc->count;
+        sortme[sortsize].cnt = sc->count;
+        sortme[sortsize].ptr = sc;
+        sortsize++;
+    }
+    qsort(sortme, sortsize, sizeof(SortItem), SortItem_cmp);
+    Table_report_printable(sortme, sortsize,
+        what, NULL,
+        StringCounter_col_fmt, NULL,
+        sum);
+    free(sortme);
 }
 
 void
@@ -1642,14 +1679,19 @@ AgentAddr_report_printable(hashtbl * tbl, const char *what)
     free(sortme);
 }
 
+
+
 void
 *printable_report(void *args)
 {
+    while(true) {
         // Call to AgentAddr_report version printable
-        AgentAddr_report_printable(Sources, "Sources");
-        sleep(5);
+        // AgentAddr_report_printable(Sources, "Sources");
+        StringCounter_report_printable(Domains[2], "Query Name");
+        sleep(10);
+    }
 
-        return NULL;
+    return NULL;
 }
 
 /*
