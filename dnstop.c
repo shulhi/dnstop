@@ -1586,7 +1586,8 @@ Table_report_printable(SortItem * sorted, int rows, const char *col1, const char
     char *file_ext = ".txt";
     size_t file_length = strlen(file_path) + strlen(ts_str) + strlen(file_ext);
 
-    char file_name[file_length];
+    // plus 2 = extra / and one null byte
+    char file_name[file_length + 2];
     snprintf(file_name, sizeof file_name, "%s/%s%s", file_path, ts_str, file_ext);
     // Create file for writing
     FILE *f = fopen(file_name, "w");
